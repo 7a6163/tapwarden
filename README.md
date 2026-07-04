@@ -5,10 +5,12 @@ An SSH agent that serves keys from **Bitwarden Secrets Manager** or a
 authorize every signature** — 1Password's per-use approval UX, on a headless /
 least-privilege Bitwarden backend.
 
-Status: **working foreground agent** — Touch ID verified from an unsigned
-binary, both backends implemented against the official SDK's protocol and
-test vectors, security-reviewed. Roadmap: background daemon (`stop`/`logs`,
-LaunchAgent), credentials in the OS keystore, signing + Homebrew packaging.
+Status: **working agent** — Touch ID verified from an unsigned binary, both
+backends implemented against the official SDK's protocol and test vectors,
+security-reviewed; Vaultwarden credentials can live in the macOS Keychain
+behind Touch ID; runs in the background as a LaunchAgent
+(`start`/`stop`/`logs`/`uninstall`). Roadmap: BWS token in the OS keystore,
+signing + Homebrew packaging.
 
 ## Why
 
@@ -83,21 +85,28 @@ instead — least privilege via account scoping.
    **only** SSH keys.
 3. In its web vault, create an **SSH key** item and paste the OpenSSH private
    key. The item's UUID is in the URL (`itemId=...`) when the item is open.
-4. Settings → Security → Keys → **View API key** → note `client_id`
-   (`user.…`) and `client_secret` — or run `sigilo setup` to do steps 3–4
-   (and write the config below) automatically.
+4. Run **`sigilo setup`**: it logs in once, obtains the personal API key for
+   you, lets you pick the keys to serve, writes the config below, and (by
+   default) stores the credentials in the **macOS Keychain** — no env vars
+   needed, and every agent read of them is gated by a Touch ID prompt.
 
 ```yaml
-# ~/.config/sigilo/config.yaml
+# ~/.config/sigilo/config.yaml (written by `sigilo setup`)
 backend: vaultwarden
 vaultwarden:
   server_url: https://vault.example.com
   email: sigilo@example.com
+  credentials: keychain   # keychain (macOS, default in setup) | env (CI / Linux)
 secret_ids:
   - <cipher uuid>
 authorization:
   mode: per_use
 ```
+
+Fallback: answer `n` to the Keychain question (or set `credentials: env`) to
+keep the credentials in env vars instead — the right choice for CI or Linux.
+`sigilo setup` prints the exact lines; they come from Settings → Security →
+Keys → **View API key** in the web vault:
 
 ```sh
 export SIGILO_VW_CLIENT_ID='user.xxxxxxxx-....'
@@ -108,19 +117,40 @@ export SIGILO_VW_MASTER_PASSWORD='...'
 ## Run
 
 ```sh
-sigilo start --fg                              # foreground (daemon mode lands in M2)
-export SSH_AUTH_SOCK="$(sigilo socket-path)"   # in the shell that will use it
-ssh-add -L                                    # lists public keys, no prompt
-ssh somehost                                  # ← Touch ID prompt per signature
+sigilo start    # background LaunchAgent: restarts on crash, starts at login
 ```
 
-Make it stick:
+`start` prints the socket path. Point SSH at it permanently — no `export`
+needed in any shell:
 
 ```sh
 # ~/.ssh/config
 Host *
   IdentityAgent <output of `sigilo socket-path`>
 ```
+
+Then:
+
+```sh
+ssh-add -L      # lists public keys, no prompt
+ssh somehost    # ← Touch ID prompt per signature
+```
+
+Manage it:
+
+```sh
+sigilo stop         # stop the agent (the LaunchAgent stays installed)
+sigilo logs         # last 50 lines of ~/Library/Logs/sigilo.log
+sigilo uninstall    # stop the agent and remove the LaunchAgent
+sigilo start --fg   # debug: run in the foreground of the current shell
+```
+
+> **Env-var credentials:** launchd does not see your shell environment. If
+> your config resolves credentials from env vars (backend `bws`, or
+> Vaultwarden `credentials: env`), the background agent cannot read them —
+> either run `sigilo start --fg` from a shell that exports them, switch to
+> `credentials: keychain` (`sigilo setup`), or add an `EnvironmentVariables`
+> dict to `~/Library/LaunchAgents/com.sigilo.agent.plist` yourself.
 
 ### Git commit signing
 
@@ -162,6 +192,11 @@ cargo test touch_id_prompt_manual -- --ignored --nocapture
 
 - Every `sign` passes the `Authorizer` (Touch ID) — there is no silent signing
   path, even for same-uid processes.
+- With `credentials: keychain` (Vaultwarden), the backend credentials live in
+  the macOS Keychain and **every read is gated by a Touch ID prompt** — a
+  recent signature approval (`grace` mode) never unlocks them. An OS-level
+  keychain ACL binding the entries to the sigilo binary requires code signing
+  and is future work.
 - Private keys, tokens, and the master password exist in memory only; error
   messages and logs never contain secret material or server response bodies.
 - The agent socket lives in a per-user 0700 directory (`$XDG_RUNTIME_DIR/sigilo`

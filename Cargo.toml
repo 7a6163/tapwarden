@@ -1,6 +1,6 @@
 [package]
 name = "sigilo"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85.0"
 description = "SSH agent backed by Bitwarden Secrets Manager with per-use biometric authorization"
@@ -34,3 +34,6 @@ ssh-key = { version = "0.6", features = ["std", "ed25519"] }                    
 signature = "2"                                                                              # M1: Signer trait for PrivateKey::try_sign
 robius-authentication = "0.1"                                                                # M0: Touch ID gate (0.2 does not exist; 0.1.1 is latest)
 rpassword = "7"                                                                              # setup wizard: hidden master-password prompt
+# M2: Vaultwarden credentials in the macOS Keychain. v3 ships no platform
+# store by default; apple-native selects the Keychain (security-framework only).
+keyring = { version = "3", features = ["apple-native"] }

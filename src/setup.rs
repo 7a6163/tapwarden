@@ -15,12 +15,15 @@ use std::io::Write;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::config::CONFIG_REL;
-use crate::secret_source::{http_client, json_capped, EncString, SymKey};
+use crate::config::{CredentialSource, CONFIG_REL};
+use crate::keychain;
+use crate::secret_source::{
+    http_client, json_capped, json_capped_limit, EncString, SymKey, MAX_SYNC_RESPONSE_BYTES,
+};
 use crate::vaultwarden::{
     derive_master_key, resolve_cipher_key, server_auth_hash, stretch_master_key,
-    validate_server_url, KdfParams, CIPHER_TYPE_SSH_KEY, DEVICE_IDENTIFIER, DEVICE_NAME,
-    DEVICE_TYPE,
+    validate_server_url, KdfParams, CIPHER_TYPE_SSH_KEY, CLIENT_VERSION, CLIENT_VERSION_HEADER,
+    DEVICE_IDENTIFIER, DEVICE_NAME, DEVICE_TYPE,
 };
 
 /// TwoFactorType::Authenticator (TOTP) in vaultwarden's `TwoFactorType`.
@@ -127,7 +130,8 @@ pub async fn run() -> Result<()> {
     let master_key = derive_master_key(&master_password, &email, &kdf)
         .context("setup failed: master key derivation")?;
     let password_hash = server_auth_hash(&master_key, &master_password);
-    drop(master_password);
+    // master_password is kept (memory only) until the storage decision below:
+    // the keychain path stores it so the agent can run without env vars.
 
     let token = password_login(&http, &server_url, &email, &password_hash).await?;
     println!("Logged in.");
@@ -150,6 +154,13 @@ pub async fn run() -> Result<()> {
     );
     println!("Obtained the personal API key.");
 
+    let answer = prompt("Store credentials in the macOS Keychain? [Y/n]: ")?;
+    let credentials = if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+        CredentialSource::Keychain
+    } else {
+        CredentialSource::Env
+    };
+
     let ciphers = fetch_sync(&http, &server_url, &token.access_token)
         .await?
         .ciphers;
@@ -171,14 +182,33 @@ pub async fn run() -> Result<()> {
         .collect();
 
     let path = config_path()?;
-    write_config_file(&path, &render_config(&server_url, &email, &chosen)?)?;
+    write_config_file(
+        &path,
+        &render_config(&server_url, &email, &chosen, credentials)?,
+    )?;
     println!("\nWrote {} (mode 0600, no secrets inside).", path.display());
 
-    println!("\nAdd these to your environment (e.g. ~/.zshenv — keep them out of anything world-readable):\n");
-    println!("  export SIGILO_VW_CLIENT_ID='{client_id}'");
-    println!("  export SIGILO_VW_CLIENT_SECRET='{client_secret}'");
-    println!("  export SIGILO_VW_MASTER_PASSWORD='<type your master password here>'");
-    println!("\nsigilo never stores or prints the master password; fill it in yourself.");
+    match credentials {
+        CredentialSource::Keychain => {
+            for (account, value) in [
+                (keychain::VW_CLIENT_ID, client_id.as_str()),
+                (keychain::VW_CLIENT_SECRET, client_secret.as_str()),
+                (keychain::VW_MASTER_PASSWORD, master_password.as_str()),
+            ] {
+                keychain::delete(account);
+                keychain::store(account, value)?;
+            }
+            println!("\nStored the credentials in the macOS Keychain (service \"sigilo\").");
+            println!("Every agent read of them is gated by a Touch ID prompt; no env vars needed.");
+        }
+        CredentialSource::Env => {
+            println!("\nAdd these to your environment (e.g. ~/.zshenv — keep them out of anything world-readable):\n");
+            println!("  export SIGILO_VW_CLIENT_ID='{client_id}'");
+            println!("  export SIGILO_VW_CLIENT_SECRET='{client_secret}'");
+            println!("  export SIGILO_VW_MASTER_PASSWORD='<type your master password here>'");
+            println!("\nsigilo never stores or prints the master password; fill it in yourself.");
+        }
+    }
     Ok(())
 }
 
@@ -190,6 +220,7 @@ async fn prelogin(
     let response = http
         .post(format!("{server_url}/identity/accounts/prelogin"))
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
         .json(&serde_json::json!({ "email": email }))
         .send()
         .await
@@ -256,6 +287,7 @@ async fn login_attempt(
     let response = http
         .post(format!("{server_url}/identity/connect/token"))
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
         .form(&form)
         .send()
         .await
@@ -290,6 +322,7 @@ async fn fetch_api_key(
         .post(format!("{server_url}/api/accounts/api-key"))
         .bearer_auth(bearer)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
         .json(&serde_json::json!({ "masterPasswordHash": password_hash }))
         .send()
         .await
@@ -312,6 +345,7 @@ async fn fetch_profile(
         .get(format!("{server_url}/api/accounts/profile"))
         .bearer_auth(bearer)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
         .send()
         .await
         .context("profile fetch failed: request error")?;
@@ -331,6 +365,7 @@ async fn fetch_sync(
         .get(format!("{server_url}/api/sync"))
         .bearer_auth(bearer)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
         .send()
         .await
         .context("sync failed: request error")?;
@@ -338,7 +373,10 @@ async fn fetch_sync(
     if !status.is_success() {
         bail!("sync failed: HTTP {status}");
     }
-    json_capped(response).await.context("sync failed")
+    // The sync payload is the entire vault — needs the larger (still hard) cap.
+    json_capped_limit(response, MAX_SYNC_RESPONSE_BYTES)
+        .await
+        .context("sync failed")
 }
 
 /// Personal-vault SSH-key items (type 5, not org-owned) with decrypted names.
@@ -390,16 +428,34 @@ fn validate_email(email: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render the config. No secrets: only env var *names* are implied (the
-/// defaults SIGILO_VW_* are baked into the config schema).
-fn render_config(server_url: &str, email: &str, secret_ids: &[Uuid]) -> Result<String> {
+/// Render the config. No secrets in either variant: `keychain` points at the
+/// macOS Keychain entries, `env` implies only env var *names* (the defaults
+/// SIGILO_VW_* are baked into the config schema).
+fn render_config(
+    server_url: &str,
+    email: &str,
+    secret_ids: &[Uuid],
+    credentials: CredentialSource,
+) -> Result<String> {
+    let (comment, source) = match credentials {
+        CredentialSource::Keychain => (
+            "# Written by `sigilo setup`. Credentials live ONLY in the macOS Keychain\n\
+             # (service \"sigilo\"); every read is gated by a Touch ID prompt.\n",
+            "keychain",
+        ),
+        CredentialSource::Env => (
+            "# Written by `sigilo setup`. Credentials live ONLY in the env vars\n\
+             # SIGILO_VW_CLIENT_ID / SIGILO_VW_CLIENT_SECRET / SIGILO_VW_MASTER_PASSWORD.\n",
+            "env",
+        ),
+    };
     let mut cfg = format!(
-        "# Written by `sigilo setup`. Credentials live ONLY in the env vars\n\
-         # SIGILO_VW_CLIENT_ID / SIGILO_VW_CLIENT_SECRET / SIGILO_VW_MASTER_PASSWORD.\n\
+        "{comment}\
          backend: vaultwarden\n\
          vaultwarden:\n\
          \x20 server_url: {}\n\
          \x20 email: {}\n\
+         \x20 credentials: {source}\n\
          secret_ids:\n",
         yaml_quoted(server_url)?,
         yaml_quoted(email)?,
@@ -627,25 +683,34 @@ mod tests {
             Uuid::parse_str("11111111-0000-0000-0000-000000000000").unwrap(),
             Uuid::parse_str("44444444-0000-0000-0000-000000000000").unwrap(),
         ];
-        let yaml = render_config("https://vault.example.com", "sigilo@example.com", &ids).unwrap();
-        // No credential material may ever appear in the file.
-        assert!(!yaml.to_lowercase().contains("password:"));
-        assert!(!yaml.contains("client_secret:"));
+        for credentials in [CredentialSource::Keychain, CredentialSource::Env] {
+            let yaml = render_config(
+                "https://vault.example.com",
+                "sigilo@example.com",
+                &ids,
+                credentials,
+            )
+            .unwrap();
+            // No credential material may ever appear in the file.
+            assert!(!yaml.to_lowercase().contains("password:"));
+            assert!(!yaml.contains("client_secret:"));
 
-        let cfg: crate::config::Config = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(cfg.backend, crate::config::Backend::Vaultwarden);
-        let vw = cfg.vaultwarden.expect("vaultwarden section");
-        assert_eq!(vw.server_url, "https://vault.example.com");
-        assert_eq!(vw.email, "sigilo@example.com");
-        assert_eq!(vw.client_id_env, "SIGILO_VW_CLIENT_ID");
-        assert_eq!(
-            cfg.secret_ids,
-            vec![
-                "11111111-0000-0000-0000-000000000000",
-                "44444444-0000-0000-0000-000000000000"
-            ]
-        );
-        assert_eq!(cfg.authorization.mode, crate::config::AuthMode::PerUse);
+            let cfg: crate::config::Config = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(cfg.backend, crate::config::Backend::Vaultwarden);
+            let vw = cfg.vaultwarden.expect("vaultwarden section");
+            assert_eq!(vw.credentials, credentials);
+            assert_eq!(vw.server_url, "https://vault.example.com");
+            assert_eq!(vw.email, "sigilo@example.com");
+            assert_eq!(vw.client_id_env, "SIGILO_VW_CLIENT_ID");
+            assert_eq!(
+                cfg.secret_ids,
+                vec![
+                    "11111111-0000-0000-0000-000000000000",
+                    "44444444-0000-0000-0000-000000000000"
+                ]
+            );
+            assert_eq!(cfg.authorization.mode, crate::config::AuthMode::PerUse);
+        }
     }
 
     #[test]

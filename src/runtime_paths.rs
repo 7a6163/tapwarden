@@ -2,12 +2,12 @@ use anyhow::{bail, Context, Result};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
-fn uid() -> u32 {
+pub(crate) fn uid() -> u32 {
     // SAFETY: getuid() is always safe; it never fails and touches no memory.
     unsafe { libc::getuid() }
 }
 
-/// A per-user, 0700 runtime directory that holds the socket and PID file.
+/// A per-user, 0700 runtime directory that holds the agent socket.
 ///
 /// Uses `$XDG_RUNTIME_DIR` (already 0700 and owned by the user) when available;
 /// otherwise a uid-suffixed dir under the temp dir. Access control comes from
@@ -41,11 +41,6 @@ pub fn runtime_dir() -> Result<PathBuf> {
 
 pub fn socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("agent.sock"))
-}
-
-#[allow(dead_code)] // M2: the background daemon writes its PID here
-pub fn pid_path() -> Result<PathBuf> {
-    Ok(runtime_dir()?.join("agent.pid"))
 }
 
 #[cfg(test)]

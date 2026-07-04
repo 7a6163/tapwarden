@@ -5,12 +5,20 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
 
-/// Context shown to the user when approving a signature.
-pub struct AuthContext<'a> {
-    pub key_comment: &'a str,
-    /// Length of the data being signed; not shown in the prompt yet.
-    #[allow(dead_code)]
-    pub data_len: usize,
+/// What the user is being asked to approve. The variant matters for `Grace`:
+/// only signatures participate in the grace window — credential unlocks always
+/// reach the real prompt, so a recent signature never silently unlocks the
+/// backend credentials.
+pub enum AuthContext<'a> {
+    /// One SSH signature with the named key.
+    Sign {
+        key_comment: &'a str,
+        /// Length of the data being signed; not shown in the prompt yet.
+        #[allow(dead_code)]
+        data_len: usize,
+    },
+    /// Reading stored backend credentials (e.g. from the macOS Keychain).
+    UnlockCredentials { reason: &'a str },
 }
 
 /// Gate that must pass before a private key produces a signature.
@@ -48,7 +56,12 @@ impl Authorizer for Biometric {
 
         // Prompt reads "sigilo is trying to <reason>" on macOS.
         // Only the key comment goes in — never key material or the data to sign.
-        let reason = format!("sign an SSH request with key \"{}\"", ctx.key_comment);
+        let reason = match ctx {
+            AuthContext::Sign { key_comment, .. } => {
+                format!("sign an SSH request with key \"{key_comment}\"")
+            }
+            AuthContext::UnlockCredentials { reason } => reason.to_string(),
+        };
 
         // blocking_authenticate blocks until the user responds; keep it off the
         // async runtime. Context/policy are built inside the closure because the
@@ -130,13 +143,19 @@ impl Grace {
 #[async_trait]
 impl Authorizer for Grace {
     async fn approve(&self, ctx: &AuthContext<'_>) -> Result<bool> {
+        // INVARIANT: only signatures ride the grace window. A credential
+        // unlock always reaches the inner prompt and is never cached.
+        let AuthContext::Sign { key_comment, .. } = ctx else {
+            return self.inner.approve(ctx).await;
+        };
+
         // ponytail: std Mutex, never held across an await; poisoning is unreachable
         // because the critical sections cannot panic.
         let within_window = self
             .last
             .lock()
             .expect("grace lock poisoned")
-            .get(ctx.key_comment)
+            .get(*key_comment)
             .is_some_and(|approval| approval.within(self.window));
         if within_window {
             return Ok(true);
@@ -147,7 +166,7 @@ impl Authorizer for Grace {
             self.last
                 .lock()
                 .expect("grace lock poisoned")
-                .insert(ctx.key_comment.to_string(), Approval::now());
+                .insert(key_comment.to_string(), Approval::now());
         }
         Ok(approved)
     }
@@ -174,9 +193,15 @@ mod tests {
     }
 
     fn ctx() -> AuthContext<'static> {
-        AuthContext {
+        AuthContext::Sign {
             key_comment: "test@key",
             data_len: 32,
+        }
+    }
+
+    fn unlock_ctx() -> AuthContext<'static> {
+        AuthContext::UnlockCredentials {
+            reason: "unlock backend credentials for Vaultwarden",
         }
     }
 
@@ -226,7 +251,7 @@ mod tests {
         let grace = Grace::new(inner, Duration::from_secs(3600));
 
         assert!(grace.approve(&ctx()).await.unwrap());
-        let other = AuthContext {
+        let other = AuthContext::Sign {
             key_comment: "other@key",
             data_len: 32,
         };
@@ -262,6 +287,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grace_window_from_a_signature_never_unlocks_credentials() {
+        let (inner, calls) = counting(true);
+        let grace = Grace::new(inner, Duration::from_secs(3600));
+
+        // A signature opens a fresh grace window...
+        assert!(grace.approve(&ctx()).await.unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // ...but a credential unlock must still reach the real prompt.
+        assert!(grace.approve(&unlock_ctx()).await.unwrap());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "credential unlock must never ride a signature's grace window"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_unlock_approval_is_never_cached() {
+        let (inner, calls) = counting(true);
+        let grace = Grace::new(inner, Duration::from_secs(3600));
+
+        assert!(grace.approve(&unlock_ctx()).await.unwrap());
+        assert!(grace.approve(&unlock_ctx()).await.unwrap());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "every credential unlock must prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn grace_does_not_cache_denial() {
         let (inner, calls) = counting(false);
         let grace = Grace::new(inner, Duration::from_secs(3600));
@@ -281,7 +337,7 @@ mod tests {
     #[ignore]
     async fn touch_id_prompt_manual() {
         let result = Biometric
-            .approve(&AuthContext {
+            .approve(&AuthContext::Sign {
                 key_comment: "m0-poc@sigilo",
                 data_len: 0,
             })

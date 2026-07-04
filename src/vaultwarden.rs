@@ -16,8 +16,11 @@ use hkdf::Hkdf;
 use hmac::Hmac;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::authorizer::{AuthContext, Authorizer};
+use crate::keychain;
 use crate::secret_source::{
     http_client, json_capped, EncString, SecretData, SecretFetcher, SymKey,
 };
@@ -30,6 +33,10 @@ pub(crate) const DEVICE_IDENTIFIER: &str = "6c11ea63-9b34-4c73-b9ca-8f8b74dd6d10
 pub(crate) const DEVICE_NAME: &str = "sigilo";
 /// 14 = "Unknown Browser" — the value vaultwarden itself falls back to.
 pub(crate) const DEVICE_TYPE: &str = "14";
+/// Vaultwarden hides SSH-key ciphers (type 5) from clients that do not declare
+/// a version >= 2024.12.0 via this header (see its api/core/ciphers.rs sync()).
+pub(crate) const CLIENT_VERSION_HEADER: &str = "Bitwarden-Client-Version";
+pub(crate) const CLIENT_VERSION: &str = "2025.6.0";
 
 /// KDF ids as reported by the server (vaultwarden `UserKdfType`).
 const KDF_PBKDF2: u32 = 0;
@@ -208,28 +215,43 @@ struct Session {
     user_key: SymKey,
 }
 
+/// Where the fetcher gets its credentials on the first `authenticate()`
+/// (`vaultwarden.credentials` in the config). No Debug on purpose.
+pub enum VwCredentials {
+    /// Values already resolved from env vars at construction.
+    Env {
+        client_id: String,
+        client_secret: String,
+        master_password: String,
+    },
+    /// Read from the macOS Keychain at first use, behind a Touch ID prompt.
+    Keychain,
+}
+
 /// `SecretFetcher` impl for a dedicated Vaultwarden account. One host serves
 /// both `/identity` and `/api`.
 pub struct VaultwardenFetcher {
     server_url: String,
     email: String,
-    client_id: String,
     http: reqwest::Client,
-    /// Lazily-established session, shared across `get` calls. The client
-    /// secret and master password live only in `Pending` and are dropped from
-    /// memory on the first successful authenticate.
+    /// Gate in front of every keychain read. This may be the same instance
+    /// that gates signatures; `Grace` never applies its window to
+    /// `AuthContext::UnlockCredentials`, so credential reads always prompt.
+    gate: Arc<dyn Authorizer>,
+    /// Lazily-established session, shared across `get` calls. Env credentials
+    /// live only in `Pending` and are dropped from memory on the first
+    /// successful authenticate; keychain credentials are read, used, and
+    /// dropped inside that same first authenticate.
     // ponytail: bearer expiry ignored — same rationale as BwsRest; add re-auth
     // on HTTP 401 if long-lived refetch appears.
     state: tokio::sync::Mutex<AuthState>,
 }
 
 enum AuthState {
-    /// Credentials held only until the first successful login; a failed
-    /// attempt leaves them in place so a later `get` can retry.
-    Pending {
-        client_secret: String,
-        master_password: String,
-    },
+    /// Credential source held only until the first successful login; a failed
+    /// attempt (or a denied unlock) leaves it in place so a later `get` can
+    /// retry.
+    Pending(VwCredentials),
     Ready(Session),
 }
 
@@ -259,42 +281,93 @@ pub(crate) fn validate_server_url(url: &str) -> Result<()> {
 // No Debug impl on purpose: the struct holds the master password, client
 // secret, and (in the session) the user key.
 
+/// Personal-API-key client ids have the form `user.<uuid>`.
+fn validate_client_id(client_id: &str) -> Result<()> {
+    // Error message is static on purpose: never echo credential values.
+    if !client_id.starts_with("user.") {
+        bail!("vaultwarden client_id must have the form user.<uuid> (personal API key)");
+    }
+    Ok(())
+}
+
 impl VaultwardenFetcher {
     pub fn new(
         server_url: &str,
         email: &str,
-        client_id: String,
-        client_secret: String,
-        master_password: String,
+        credentials: VwCredentials,
+        gate: Arc<dyn Authorizer>,
     ) -> Result<Self> {
-        // Error messages are static on purpose: never echo credential values.
         validate_server_url(server_url)?;
-        if !client_id.starts_with("user.") {
-            bail!("vaultwarden client_id must have the form user.<uuid> (personal API key)");
+        if let VwCredentials::Env { client_id, .. } = &credentials {
+            validate_client_id(client_id)?;
         }
         Ok(Self {
             server_url: server_url.trim_end_matches('/').to_string(),
             email: email.to_string(),
-            client_id,
             http: http_client()?,
-            state: tokio::sync::Mutex::new(AuthState::Pending {
+            gate,
+            state: tokio::sync::Mutex::new(AuthState::Pending(credentials)),
+        })
+    }
+
+    /// Resolve the three credential values from the pending source. For the
+    /// keychain the Touch ID gate must approve BEFORE anything is read.
+    async fn acquire_credentials(
+        &self,
+        pending: &VwCredentials,
+    ) -> Result<(String, String, String)> {
+        match pending {
+            VwCredentials::Env {
+                client_id,
                 client_secret,
                 master_password,
-            }),
-        })
+            } => Ok((
+                client_id.clone(),
+                client_secret.clone(),
+                master_password.clone(),
+            )),
+            VwCredentials::Keychain => {
+                let ctx = AuthContext::UnlockCredentials {
+                    reason: "unlock backend credentials for Vaultwarden",
+                };
+                let approved = self
+                    .gate
+                    .approve(&ctx)
+                    .await
+                    .context("failed to evaluate the credential-unlock authorization")?;
+                if !approved {
+                    // Static message; state stays Pending so the next request
+                    // can raise the prompt again.
+                    bail!("credential unlock denied — the keychain was not read");
+                }
+                let client_id = keychain::read(keychain::VW_CLIENT_ID)?;
+                validate_client_id(&client_id)?;
+                Ok((
+                    client_id,
+                    keychain::read(keychain::VW_CLIENT_SECRET)?,
+                    keychain::read(keychain::VW_MASTER_PASSWORD)?,
+                ))
+            }
+        }
     }
 
     /// Personal-API-key login + user-key decryption. HTTP error bodies are
     /// deliberately dropped: they can echo request parameters.
-    async fn authenticate(&self, client_secret: &str, master_password: &str) -> Result<Session> {
+    async fn authenticate(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        master_password: &str,
+    ) -> Result<Session> {
         let response = self
             .http
             .post(format!("{}/identity/connect/token", self.server_url))
             .header(reqwest::header::ACCEPT, "application/json")
+            .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
             .form(&[
                 ("grant_type", "client_credentials"),
                 ("scope", "api"),
-                ("client_id", self.client_id.as_str()),
+                ("client_id", client_id),
                 ("client_secret", client_secret),
                 ("deviceIdentifier", DEVICE_IDENTIFIER),
                 ("deviceName", DEVICE_NAME),
@@ -358,13 +431,14 @@ impl VaultwardenFetcher {
 impl SecretFetcher for VaultwardenFetcher {
     async fn get(&self, id: Uuid) -> Result<SecretData> {
         let mut state = self.state.lock().await;
-        if let AuthState::Pending {
-            client_secret,
-            master_password,
-        } = &*state
-        {
-            let session = self.authenticate(client_secret, master_password).await?;
-            // Success: replacing the state drops the credentials from memory.
+        if let AuthState::Pending(pending) = &*state {
+            let (client_id, client_secret, master_password) =
+                self.acquire_credentials(pending).await?;
+            let session = self
+                .authenticate(&client_id, &client_secret, &master_password)
+                .await?;
+            // Success: replacing the state drops the credentials from memory
+            // (the keychain-read copies go out of scope right here too).
             *state = AuthState::Ready(session);
         }
         let AuthState::Ready(session) = &*state else {
@@ -376,6 +450,7 @@ impl SecretFetcher for VaultwardenFetcher {
             .get(format!("{}/api/ciphers/{}", self.server_url, id))
             .bearer_auth(&session.bearer)
             .header(reqwest::header::ACCEPT, "application/json")
+            .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
             .send()
             .await
             .context("cipher fetch failed: request error")?;
@@ -660,10 +735,23 @@ mod tests {
         assert!(extract_secret(cipher, &key).is_err());
     }
 
+    fn env_creds(client_id: &str, secret: &str) -> VwCredentials {
+        VwCredentials::Env {
+            client_id: client_id.to_string(),
+            client_secret: secret.to_string(),
+            master_password: secret.to_string(),
+        }
+    }
+
     #[test]
     fn constructor_requires_https_except_for_localhost() {
         let mk = |url: &str| {
-            VaultwardenFetcher::new(url, "a@b.c", "user.x".into(), "s".into(), "p".into())
+            VaultwardenFetcher::new(
+                url,
+                "a@b.c",
+                env_creds("user.x", "s"),
+                Arc::new(crate::authorizer::AlwaysAllow),
+            )
         };
         assert!(mk("https://vault.example.com").is_ok());
         assert!(mk("http://localhost:8080").is_ok());
@@ -685,15 +773,59 @@ mod tests {
             let err = VaultwardenFetcher::new(
                 server,
                 "sigilo@example.com",
-                client_id,
-                secret_marker.to_string(),
-                secret_marker.to_string(),
+                env_creds(&client_id, secret_marker),
+                Arc::new(crate::authorizer::AlwaysAllow),
             )
             .err()
             .expect("constructor must reject");
             assert!(
                 !format!("{err:#}").contains(secret_marker),
                 "error leaked a credential: {err:#}"
+            );
+        }
+    }
+
+    /// A denied credential unlock must fail with a static message, never
+    /// touch the keychain, and leave the fetcher able to prompt again on the
+    /// next request (agent keeps running).
+    #[tokio::test]
+    async fn denied_unlock_bails_before_the_keychain_and_can_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Denying(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Authorizer for Denying {
+            async fn approve(&self, ctx: &AuthContext<'_>) -> Result<bool> {
+                assert!(matches!(ctx, AuthContext::UnlockCredentials { .. }));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = VaultwardenFetcher::new(
+            "https://vault.example.com",
+            "a@b.c",
+            VwCredentials::Keychain,
+            Arc::new(Denying(calls.clone())),
+        )
+        .unwrap();
+
+        let id = Uuid::from_u128(1);
+        for expected_calls in [1, 2] {
+            // No `.expect_err()`: SecretData holds a private key and must
+            // never derive Debug, so extract the error without printing Ok.
+            let result = fetcher.get(id).await;
+            assert!(result.is_err(), "denied unlock must fail");
+            let err = result.err().expect("checked is_err above");
+            assert!(
+                format!("{err:#}").contains("denied"),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_calls,
+                "every retry must prompt again"
             );
         }
     }
@@ -712,9 +844,12 @@ mod tests {
         let fetcher = VaultwardenFetcher::new(
             &var("SIGILO_VW_SERVER"),
             &var("SIGILO_VW_EMAIL"),
-            var("SIGILO_VW_CLIENT_ID"),
-            var("SIGILO_VW_CLIENT_SECRET"),
-            var("SIGILO_VW_MASTER_PASSWORD"),
+            VwCredentials::Env {
+                client_id: var("SIGILO_VW_CLIENT_ID"),
+                client_secret: var("SIGILO_VW_CLIENT_SECRET"),
+                master_password: var("SIGILO_VW_MASTER_PASSWORD"),
+            },
+            Arc::new(crate::authorizer::AlwaysAllow),
         )
         .unwrap();
         let secret = fetcher.get(id).await.unwrap();

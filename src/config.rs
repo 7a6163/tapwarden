@@ -36,20 +36,36 @@ pub enum Backend {
     Vaultwarden,
 }
 
-/// Vaultwarden backend settings. Only env var *names* live here — the client
-/// secret and master password are resolved from the environment at use time.
+/// Vaultwarden backend settings. No credential values live here — either only
+/// env var *names* (`credentials: env`, resolved at use time) or nothing at
+/// all (`credentials: keychain`, read from the macOS Keychain behind Touch ID).
 #[derive(Debug, Deserialize)]
 pub struct VaultwardenConfig {
     /// Full base URL; Vaultwarden serves /identity and /api under one host.
     pub server_url: String,
     /// Account email (part of the master key KDF salt).
     pub email: String,
+    /// Where the client id/secret and master password come from. Defaults to
+    /// `env` so existing configs behave unchanged; when `keychain`, the three
+    /// `*_env` names below are unused.
+    #[serde(default)]
+    pub credentials: CredentialSource,
     #[serde(default = "default_vw_client_id_env")]
     pub client_id_env: String,
     #[serde(default = "default_vw_client_secret_env")]
     pub client_secret_env: String,
     #[serde(default = "default_vw_master_password_env")]
     pub master_password_env: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// Resolve from the configured env vars at use time (CI / Linux).
+    #[default]
+    Env,
+    /// Read from the macOS Keychain, behind a Touch ID prompt on every read.
+    Keychain,
 }
 
 impl VaultwardenConfig {
@@ -215,9 +231,23 @@ mod tests {
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         cfg.validate().unwrap();
         let vw = cfg.vaultwarden.unwrap();
+        assert_eq!(vw.credentials, CredentialSource::Env, "must default to env");
         assert_eq!(vw.client_id_env, "SIGILO_VW_CLIENT_ID");
         assert_eq!(vw.client_secret_env, "SIGILO_VW_CLIENT_SECRET");
         assert_eq!(vw.master_password_env, "SIGILO_VW_MASTER_PASSWORD");
+    }
+
+    #[test]
+    fn vaultwarden_keychain_credentials_parse() {
+        let yaml = format!(
+            "{MINIMAL_YAML}backend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: sigilo@example.com\n  credentials: keychain\n"
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.vaultwarden.unwrap().credentials,
+            CredentialSource::Keychain
+        );
     }
 
     #[test]
@@ -225,6 +255,7 @@ mod tests {
         let vw = VaultwardenConfig {
             server_url: "https://vault.example.com".into(),
             email: "sigilo@example.com".into(),
+            credentials: CredentialSource::default(),
             client_id_env: default_vw_client_id_env(),
             client_secret_env: "SIGILO_TEST_DEFINITELY_UNSET_VW_SECRET".into(),
             master_password_env: default_vw_master_password_env(),

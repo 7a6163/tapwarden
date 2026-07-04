@@ -12,10 +12,10 @@ use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
 use crate::authorizer::{AuthContext, Authorizer, Biometric, Grace};
-use crate::config::{AuthMode, Backend, Config};
+use crate::config::{AuthMode, Backend, Config, CredentialSource};
 use crate::runtime_paths;
 use crate::secret_source::{BwsRest, SecretFetcher};
-use crate::vaultwarden::VaultwardenFetcher;
+use crate::vaultwarden::{VaultwardenFetcher, VwCredentials};
 
 struct LoadedKey {
     key: PrivateKey,
@@ -27,7 +27,7 @@ struct LoadedKey {
 struct KeyService {
     secret_ids: Vec<Uuid>,
     fetcher: Box<dyn SecretFetcher>,
-    authorizer: Box<dyn Authorizer>,
+    authorizer: Arc<dyn Authorizer>,
     keys: tokio::sync::Mutex<HashMap<Uuid, LoadedKey>>,
 }
 
@@ -35,7 +35,7 @@ impl KeyService {
     fn new(
         secret_ids: Vec<Uuid>,
         fetcher: Box<dyn SecretFetcher>,
-        authorizer: Box<dyn Authorizer>,
+        authorizer: Arc<dyn Authorizer>,
     ) -> Self {
         Self {
             secret_ids,
@@ -112,7 +112,7 @@ impl KeyService {
 
         // INVARIANT: every sign passes through the Authorizer before the key
         // is used — this gate is sigilo's whole point.
-        let ctx = AuthContext {
+        let ctx = AuthContext::Sign {
             key_comment: &comment,
             data_len: request.data.len(),
         };
@@ -144,9 +144,13 @@ impl Session for SigiloSession {
     }
 }
 
-/// Backend selection. Secrets are resolved from the environment here, at use
-/// time, and immediately move into the fetcher (memory only).
-fn build_fetcher(config: &Config) -> Result<Box<dyn SecretFetcher>> {
+/// Backend selection. Env-sourced secrets are resolved here, at use time, and
+/// immediately move into the fetcher (memory only); keychain-sourced ones are
+/// read at first authenticate, behind the authorizer.
+fn build_fetcher(
+    config: &Config,
+    authorizer: Arc<dyn Authorizer>,
+) -> Result<Box<dyn SecretFetcher>> {
     match config.backend {
         Backend::Bws => {
             let token = config.access_token()?;
@@ -161,24 +165,26 @@ fn build_fetcher(config: &Config) -> Result<Box<dyn SecretFetcher>> {
             let vw = config.vaultwarden.as_ref().context(
                 "backend is vaultwarden but the `vaultwarden` config section is missing",
             )?;
+            let credentials = match vw.credentials {
+                CredentialSource::Env => VwCredentials::Env {
+                    client_id: vw.client_id()?,
+                    client_secret: vw.client_secret()?,
+                    master_password: vw.master_password()?,
+                },
+                CredentialSource::Keychain => VwCredentials::Keychain,
+            };
             Ok(Box::new(
-                VaultwardenFetcher::new(
-                    &vw.server_url,
-                    &vw.email,
-                    vw.client_id()?,
-                    vw.client_secret()?,
-                    vw.master_password()?,
-                )
-                .context("failed to initialize the Vaultwarden client")?,
+                VaultwardenFetcher::new(&vw.server_url, &vw.email, credentials, authorizer)
+                    .context("failed to initialize the Vaultwarden client")?,
             ))
         }
     }
 }
 
-fn build_authorizer(config: &Config) -> Box<dyn Authorizer> {
+fn build_authorizer(config: &Config) -> Arc<dyn Authorizer> {
     match config.authorization.mode {
-        AuthMode::PerUse => Box::new(Biometric),
-        AuthMode::Grace => Box::new(Grace::new(
+        AuthMode::PerUse => Arc::new(Biometric),
+        AuthMode::Grace => Arc::new(Grace::new(
             Box::new(Biometric),
             Duration::from_secs(config.authorization.grace_seconds),
         )),
@@ -192,10 +198,13 @@ pub async fn run_foreground(config: Config) -> Result<()> {
         .map(|s| Uuid::parse_str(s).with_context(|| format!("secret id `{s}` is not a UUID")))
         .collect::<Result<Vec<_>>>()?;
 
+    // One authorizer instance gates both signatures and (for the keychain
+    // credential source) backend credential reads — the latter always prompt.
+    let authorizer = build_authorizer(&config);
     let service = Arc::new(KeyService::new(
         secret_ids,
-        build_fetcher(&config)?,
-        build_authorizer(&config),
+        build_fetcher(&config, authorizer.clone())?,
+        authorizer,
     ));
 
     let socket = runtime_paths::socket_path()?;
@@ -313,7 +322,7 @@ IpsAF9FLkO16mpjqAr37AAAAEHVuaXQtdGVzdEBzaWdpbG8BAgMEBQ==
 
     fn service_with(allow: bool) -> (KeyService, Arc<AtomicUsize>, SignRequest) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let authorizer = Box::new(Counting {
+        let authorizer = Arc::new(Counting {
             allow,
             calls: calls.clone(),
         });
@@ -321,7 +330,7 @@ IpsAF9FLkO16mpjqAr37AAAAEHVuaXQtdGVzdEBzaWdpbG8BAgMEBQ==
         (service, calls, request)
     }
 
-    fn service_with_authorizer(authorizer: Box<dyn Authorizer>) -> (KeyService, SignRequest) {
+    fn service_with_authorizer(authorizer: Arc<dyn Authorizer>) -> (KeyService, SignRequest) {
         let id = Uuid::from_u128(1);
         let fetcher = FakeFetcher(HashMap::from([(id, TEST_KEY.to_string())]));
         let pubkey = PrivateKey::from_openssh(TEST_KEY)
@@ -388,7 +397,7 @@ IpsAF9FLkO16mpjqAr37AAAAEHVuaXQtdGVzdEBzaWdpbG8BAgMEBQ==
             allow: true,
             calls: calls.clone(),
         });
-        let grace = Box::new(Grace::new(inner, Duration::from_secs(3600)));
+        let grace = Arc::new(Grace::new(inner, Duration::from_secs(3600)));
         let (service, request) = service_with_authorizer(grace);
 
         service.sign(request.clone()).await.unwrap();
@@ -417,7 +426,7 @@ IpsAF9FLkO16mpjqAr37AAAAEHVuaXQtdGVzdEBzaWdpbG8BAgMEBQ==
         let service = KeyService::new(
             vec![missing, good],
             Box::new(fetcher),
-            Box::new(crate::authorizer::AlwaysAllow),
+            Arc::new(crate::authorizer::AlwaysAllow),
         );
         let ids = service.identities().await;
         assert_eq!(
@@ -435,7 +444,7 @@ IpsAF9FLkO16mpjqAr37AAAAEHVuaXQtdGVzdEBzaWdpbG8BAgMEBQ==
         let empty = KeyService::new(
             vec![],
             Box::new(FakeFetcher(HashMap::new())),
-            Box::new(Counting {
+            Arc::new(Counting {
                 allow: true,
                 calls: calls.clone(),
             }),

@@ -167,11 +167,21 @@ pub(crate) fn make_enc_string(plaintext: &[u8], key: &SymKey, iv: [u8; 16]) -> S
 /// Hard cap on any backend HTTP response body: a malicious or compromised
 /// server must not be able to OOM the agent with an unbounded body.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
+/// Higher cap for `/api/sync` only: it returns the whole vault, which for a
+/// well-populated account easily exceeds 1 MiB. Setup-time only, still bounded.
+pub(crate) const MAX_SYNC_RESPONSE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Read a JSON response body incrementally with a hard size cap, then
 /// deserialize. Error messages are static: response content is never echoed.
 pub(crate) async fn json_capped<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T> {
+    json_capped_limit(response, MAX_RESPONSE_BYTES).await
+}
+
+pub(crate) async fn json_capped_limit<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
+    limit: usize,
 ) -> Result<T> {
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = response
@@ -179,8 +189,8 @@ pub(crate) async fn json_capped<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|_| anyhow!("failed to read the response body"))?
     {
-        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            bail!("response body exceeds the 1 MiB limit");
+        if body.len() + chunk.len() > limit {
+            bail!("response body exceeds the size limit");
         }
         body.extend_from_slice(&chunk);
     }

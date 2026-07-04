@@ -18,12 +18,15 @@ secret_ids:
 # from a DEDICATED account's personal vault (org-owned items are rejected).
 # The server must run with EXPERIMENTAL_CLIENT_FEATURE_FLAGS=ssh-key-vault-item
 # to create such items, and the keys must be in OpenSSH private key format.
-# Credentials (personal API key + master password) live ONLY in the env vars
-# named below.
+# Credentials (personal API key + master password) live either in the macOS
+# Keychain (credentials: keychain, stored by `sigilo setup`; every read is
+# gated by a Touch ID prompt) or ONLY in the env vars named below
+# (credentials: env, the default — for CI / Linux). Never in this file.
 # vaultwarden:
 #   server_url: https://vault.example.com   # full base URL; serves /identity and /api
 #   email: sigilo@example.com
-#   client_id_env: SIGILO_VW_CLIENT_ID              # holds user.<uuid>
+#   credentials: env                        # keychain | env (default: env)
+#   client_id_env: SIGILO_VW_CLIENT_ID              # holds user.<uuid>  (credentials: env only)
 #   client_secret_env: SIGILO_VW_CLIENT_SECRET
 #   master_password_env: SIGILO_VW_MASTER_PASSWORD
 
