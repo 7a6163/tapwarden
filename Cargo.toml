@@ -21,7 +21,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde_json = "1.0"                                                                           # M1: BWS response payloads
 # M1: BWS crypto — EncString (AES-256-CBC + HMAC-SHA256) + access-token key derivation
 aes = "0.8"
-cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+cbc = { version = "0.2", features = ["alloc", "block-padding"] }
 hmac = "0.13"
 sha2 = "0.10"
 hkdf = "0.12"
