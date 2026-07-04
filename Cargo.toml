@@ -31,7 +31,7 @@ pbkdf2 = { version = "0.12", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 ssh-agent-lib = "0.5"                                                                        # M1: agent protocol
 ssh-key = { version = "0.6", features = ["std", "ed25519"] }                                 # M1: key ops (ed25519-first)
-signature = "2"                                                                              # M1: Signer trait for PrivateKey::try_sign
+signature = "3"                                                                              # M1: Signer trait for PrivateKey::try_sign
 robius-authentication = "0.1"                                                                # M0: Touch ID gate (0.2 does not exist; 0.1.1 is latest)
 rpassword = "7"                                                                              # setup wizard: hidden master-password prompt
 # M2: Vaultwarden credentials in the macOS Keychain. v3 ships no platform
