@@ -6,6 +6,26 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # RustCrypto crates share a `digest` version and must be upgraded as one
+      # set — a lone major bump splits `digest` and fails to compile. Take only
+      # patch updates here; do the 0.13/0.11 jump manually, all together.
+      - dependency-name: hkdf
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      - dependency-name: hmac
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      - dependency-name: sha2
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      - dependency-name: pbkdf2
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      - dependency-name: aes
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      - dependency-name: cbc
+        update-types: [version-update:semver-minor, version-update:semver-major]
+      # signature must track ssh-key's version (see Cargo.toml pin); it can only
+      # move when ssh-agent-lib adopts ssh-key 0.7.
+      - dependency-name: signature
+        update-types: [version-update:semver-minor, version-update:semver-major]
   - package-ecosystem: github-actions
     directory: /
     schedule:
