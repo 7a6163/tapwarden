@@ -29,7 +29,7 @@ base64 = "0.22"
 # M2.5: Vaultwarden master-key KDF (feature sets mirror the official SDK's)
 pbkdf2 = { version = "0.12", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
-ssh-agent-lib = "0.5"                                                                        # M1: agent protocol
+ssh-agent-lib = "0.6"                                                                        # M1: agent protocol
 ssh-key = { version = "0.6", features = ["std", "ed25519"] }                                 # M1: key ops (ed25519-first)
 signature = "=2.2.0"                                                                         # M1: Signer trait for PrivateKey::try_sign — pinned to ssh-key's version (a v3 split breaks the trait)
 robius-authentication = "0.1"                                                                # M0: Touch ID gate (0.2 does not exist; 0.1.1 is latest)

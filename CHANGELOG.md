@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.1] - 2026-07-04
 
+### Changed
+
+- Upgrade `ssh-agent-lib` 0.5 → 0.6 (`Identity`/`SignRequest` now carry a
+  `PublicCredential` instead of a bare public key).
+
 ### Fixed
 
 - Pin `signature` to the version `ssh-key` uses; a v3 release resolved into a

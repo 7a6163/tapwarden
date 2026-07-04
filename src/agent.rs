@@ -6,7 +6,7 @@ use anyhow::{bail, Context as _, Result};
 use signature::Signer as _;
 use ssh_agent_lib::agent::{listen, Session};
 use ssh_agent_lib::error::AgentError;
-use ssh_agent_lib::proto::{Identity, SignRequest};
+use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
 use ssh_key::{Algorithm, PrivateKey, Signature};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
@@ -92,7 +92,7 @@ impl KeyService {
             .await
             .values()
             .map(|k| Identity {
-                pubkey: k.key.public_key().key_data().clone(),
+                credential: PublicCredential::Key(k.key.public_key().key_data().clone()),
                 comment: k.comment.clone(),
             })
             .collect()
@@ -105,7 +105,7 @@ impl KeyService {
             let keys = self.loaded_keys().await;
             let entry = keys
                 .values()
-                .find(|k| *k.key.public_key().key_data() == request.pubkey)
+                .find(|k| k.key.public_key().key_data() == request.credential.key_data())
                 .ok_or(AgentError::Failure)?;
             (entry.key.clone(), entry.comment.clone())
         };
@@ -333,13 +333,13 @@ IpsAF9FLkO16mpjqAr37AAAAEHVuaXQtdGVzdEBzaWdpbG8BAgMEBQ==
     fn service_with_authorizer(authorizer: Arc<dyn Authorizer>) -> (KeyService, SignRequest) {
         let id = Uuid::from_u128(1);
         let fetcher = FakeFetcher(HashMap::from([(id, TEST_KEY.to_string())]));
-        let pubkey = PrivateKey::from_openssh(TEST_KEY)
+        let key_data = PrivateKey::from_openssh(TEST_KEY)
             .unwrap()
             .public_key()
             .key_data()
             .clone();
         let request = SignRequest {
-            pubkey,
+            credential: PublicCredential::Key(key_data),
             data: b"data-to-sign".to_vec(),
             flags: 0,
         };
