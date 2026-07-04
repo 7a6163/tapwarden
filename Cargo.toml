@@ -24,7 +24,7 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 hmac = "0.13"
 sha2 = "0.10"
-hkdf = "0.12"
+hkdf = "0.13"
 base64 = "0.22"
 # M2.5: Vaultwarden master-key KDF (feature sets mirror the official SDK's)
 pbkdf2 = { version = "0.12", default-features = false }
