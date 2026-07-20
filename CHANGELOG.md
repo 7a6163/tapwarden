@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-07-20
+
+### Changed
+
+- Renamed the project from `sigilo` to `tapwarden`. This includes the crate
+  and binary name, the config directory (`~/.config/tapwarden`), the
+  LaunchAgent label (`com.tapwarden.agent`), the log file
+  (`~/Library/Logs/tapwarden.log`), the Keychain service name, and all
+  environment variable prefixes (`SIGILO_*` → `TAPWARDEN_*`). The old `sigilo`
+  crate on crates.io is yanked; migrate by reinstalling `tapwarden` and
+  renaming your `SIGILO_VW_*` env vars to `TAPWARDEN_VW_*`.
+
 ## [0.1.3] - 2026-07-06
 
 ### Added
