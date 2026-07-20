@@ -215,7 +215,9 @@ pub async fn run() -> Result<()> {
             println!("  export TAPWARDEN_VW_CLIENT_ID='{client_id}'");
             println!("  export TAPWARDEN_VW_CLIENT_SECRET='{client_secret}'");
             println!("  export TAPWARDEN_VW_MASTER_PASSWORD='<type your master password here>'");
-            println!("\ntapwarden never stores or prints the master password; fill it in yourself.");
+            println!(
+                "\ntapwarden never stores or prints the master password; fill it in yourself."
+            );
         }
     }
     Ok(())

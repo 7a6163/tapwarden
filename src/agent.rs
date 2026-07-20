@@ -250,7 +250,10 @@ pub async fn run_foreground(config: Config) -> Result<()> {
     // cleanup failure mask the listener result.
     if let Err(e) = std::fs::remove_file(&socket) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("tapwarden: failed to remove socket {}: {e}", socket.display());
+            eprintln!(
+                "tapwarden: failed to remove socket {}: {e}",
+                socket.display()
+            );
         }
     }
     result
