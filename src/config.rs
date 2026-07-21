@@ -99,6 +99,13 @@ fn env_var(name: &str) -> Result<String> {
 pub struct Authorization {
     #[serde(default)]
     pub mode: AuthMode,
+    /// Presence factor gating every signature: `touch_id` (default) or
+    /// `yubikey` (a FIDO2 security-key touch; requires a registered credential).
+    #[serde(default)]
+    pub factor: AuthFactor,
+    /// Required when `factor: yubikey`; written by `tapwarden register-yubikey`.
+    #[serde(default)]
+    pub yubikey: Option<YubikeyConfig>,
     /// In `grace` mode: seconds a signature stays authorized before re-prompting.
     #[serde(default = "default_grace")]
     pub grace_seconds: u64,
@@ -108,9 +115,31 @@ impl Default for Authorization {
     fn default() -> Self {
         Self {
             mode: AuthMode::default(),
+            factor: AuthFactor::default(),
+            yubikey: None,
             grace_seconds: default_grace(),
         }
     }
+}
+
+/// Which presence factor authorizes each signature.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthFactor {
+    /// macOS Touch ID (LocalAuthentication).
+    #[default]
+    TouchId,
+    /// A FIDO2 security key (e.g. YubiKey): a physical touch per signature.
+    Yubikey,
+}
+
+/// FIDO2 credential registered by `tapwarden register-yubikey`. The credential
+/// id is only a handle — useless without the physical key — so it lives in the
+/// config file, not a secret store.
+#[derive(Debug, Deserialize)]
+pub struct YubikeyConfig {
+    /// Base64 credential id returned at registration.
+    pub credential_id: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
@@ -193,6 +222,12 @@ impl Config {
         }
         if self.backend == Backend::Vaultwarden && self.vaultwarden.is_none() {
             bail!("backend is vaultwarden but the `vaultwarden` config section is missing");
+        }
+        if self.authorization.factor == AuthFactor::Yubikey && self.authorization.yubikey.is_none()
+        {
+            bail!(
+                "authorization.factor is yubikey but no credential is registered — run `tapwarden register-yubikey`"
+            );
         }
         Ok(())
     }

@@ -43,6 +43,9 @@ enum Commands {
     /// (needed for `credentials: keychain`, so the background agent can fetch
     /// keys without an inherited env var)
     StoreToken,
+    /// Register a FIDO2 security key (e.g. YubiKey) as the presence factor;
+    /// prints the config to add for `authorization.factor: yubikey`
+    RegisterYubikey,
     /// Read-only diagnostics: config, credentials, LaunchAgent, socket, SSH
     /// wiring, and Touch ID. Exits non-zero if any check fails.
     Doctor {
@@ -80,6 +83,14 @@ async fn main() -> Result<()> {
         }
         Commands::Setup => setup::run().await?,
         Commands::StoreToken => setup::store_bws_token()?,
+        Commands::RegisterYubikey => {
+            let credential_id = authorizer::register_yubikey()?;
+            println!("\nRegistered. Add this to ~/.config/tapwarden/config.yaml:\n");
+            println!("authorization:");
+            println!("  factor: yubikey");
+            println!("  yubikey:");
+            println!("    credential_id: {credential_id}");
+        }
         Commands::Doctor {
             config,
             check_backend,

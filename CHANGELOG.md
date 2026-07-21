@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **YubiKey / FIDO2 as the presence factor**: `authorization.factor: yubikey`
+  gates every signature (and every credential unlock) on a physical touch of a
+  FIDO2 security key instead of Touch ID, via a `get_assertion` against a
+  credential registered once with the new `tapwarden register-yubikey` command
+  (touch-only on each use; the key's PIN is only needed at registration). The
+  credential id is stored in the config (`authorization.yubikey.credential_id`)
+  — it is only a handle, useless without the physical key. `factor` defaults to
+  `touch_id`, so existing configs are unchanged. `doctor` reports whether a
+  security key is connected when this factor is selected.
 - **BWS access token in the macOS Keychain**: the Bitwarden Secrets Manager
   backend now supports `credentials: keychain` (mirroring the Vaultwarden
   backend). Store the token with the new `tapwarden store-token` command; the

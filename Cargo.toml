@@ -37,6 +37,7 @@ ssh-agent-lib = "0.6"                                                           
 ssh-key = { version = "0.6", features = ["std", "ed25519"] }                                 # M1: key ops (ed25519-first)
 signature = "=2.2.0"                                                                         # M1: Signer trait for PrivateKey::try_sign — pinned to ssh-key's version (a v3 split breaks the trait)
 robius-authentication = "0.1"                                                                # M0: Touch ID gate (0.2 does not exist; 0.1.1 is latest)
+ctap-hid-fido2 = "3.5"                                                                       # optional presence factor: YubiKey / FIDO2 touch (CTAP2 over HID)
 rpassword = "7"                                                                              # setup wizard: hidden master-password prompt
 # M2: Vaultwarden credentials in the macOS Keychain. v3 ships no platform
 # store by default; apple-native selects the Keychain (security-framework only).

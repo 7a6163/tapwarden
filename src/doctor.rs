@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::config::{Backend, Config, CredentialSource};
+use crate::config::{AuthFactor, Backend, Config, CredentialSource};
 use crate::{agent, authorizer, config, daemon, runtime_paths};
 
 #[derive(Clone, Copy)]
@@ -62,7 +62,7 @@ pub async fn run(config_path: Option<&str>, check_backend: bool) -> Result<()> {
     if let Some(cfg) = cfg.as_ref() {
         check_credentials(&mut r, cfg);
     }
-    check_touch_id(&mut r);
+    check_presence(&mut r, cfg.as_ref());
     check_agent(&mut r);
     check_ssh_wiring(&mut r);
 
@@ -208,20 +208,33 @@ fn check_credentials(r: &mut Report, cfg: &Config) {
     }
 }
 
-fn check_touch_id(r: &mut Report) {
-    if authorizer::biometrics_available() {
-        r.line(
-            Status::Ok,
-            "touch id",
-            "LocalAuthentication policy available",
-        );
-    } else {
-        r.line(
-            Status::Warn,
-            "touch id",
-            "biometric policy unavailable on this platform",
-        );
-        r.hint("signing falls back to the account password prompt");
+fn check_presence(r: &mut Report, cfg: Option<&Config>) {
+    let factor = cfg.map(|c| c.authorization.factor).unwrap_or_default();
+    match factor {
+        AuthFactor::TouchId => {
+            if authorizer::biometrics_available() {
+                r.line(
+                    Status::Ok,
+                    "touch id",
+                    "LocalAuthentication policy available",
+                );
+            } else {
+                r.line(
+                    Status::Warn,
+                    "touch id",
+                    "biometric policy unavailable on this platform",
+                );
+                r.hint("signing falls back to the account password prompt");
+            }
+        }
+        AuthFactor::Yubikey => {
+            if authorizer::yubikey_present() {
+                r.line(Status::Ok, "yubikey", "a FIDO2 security key is connected");
+            } else {
+                r.line(Status::Warn, "yubikey", "no FIDO2 security key detected");
+                r.hint("insert your YubiKey — a touch is required for every signature");
+            }
+        }
     }
 }
 

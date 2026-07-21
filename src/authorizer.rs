@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 
 /// What the user is being asked to approve. The variant matters for `Grace`:
@@ -109,6 +109,94 @@ impl Authorizer for Biometric {
 
         outcome.context("failed to evaluate biometric authorization")
     }
+}
+
+/// RP id used for both registration and per-signature assertions. Constant so
+/// a credential registered once keeps working across upgrades.
+pub const YUBIKEY_RP_ID: &str = "tapwarden";
+
+/// Presence factor backed by a FIDO2 security key (e.g. YubiKey). Each
+/// approval runs a `get_assertion` against the credential registered by
+/// `register_yubikey`; the hardware only completes it after a physical touch,
+/// so every signature (and every credential unlock) needs the key present and
+/// tapped — the YubiKey analog of the Touch ID gate.
+pub struct YubikeyTouch {
+    credential_id: Vec<u8>,
+}
+
+impl YubikeyTouch {
+    pub fn new(credential_id: Vec<u8>) -> Self {
+        Self { credential_id }
+    }
+}
+
+#[async_trait]
+impl Authorizer for YubikeyTouch {
+    async fn approve(&self, _ctx: &AuthContext<'_>) -> Result<bool> {
+        let credential_id = self.credential_id.clone();
+        // Blocking HID I/O: keep it off the async runtime, like Biometric.
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            use ctap_hid_fido2::{
+                Cfg, FidoKeyHidFactory, fidokey::GetAssertionArgsBuilder, verifier,
+            };
+            let device = FidoKeyHidFactory::create(&Cfg::init()).map_err(|e| {
+                anyhow!("no FIDO2 security key found (or more than one connected): {e:?}")
+            })?;
+            let challenge = verifier::create_challenge();
+            let args = GetAssertionArgsBuilder::new(YUBIKEY_RP_ID, &challenge)
+                .credential_id(&credential_id)
+                .build();
+            match device.get_assertion_with_args(&args) {
+                Ok(assertions) => Ok(!assertions.is_empty()),
+                // A timeout, wrong key, or no touch is a denial, not a crash:
+                // the signature simply fails, like a canceled Touch ID prompt.
+                Err(_) => Ok(false),
+            }
+        })
+        .await
+        .context("yubikey authorization task panicked")?
+    }
+}
+
+/// True when a FIDO2 security key is reachable over HID. For `doctor`.
+pub fn yubikey_present() -> bool {
+    use ctap_hid_fido2::{Cfg, FidoKeyHidFactory};
+    FidoKeyHidFactory::create(&Cfg::init()).is_ok()
+}
+
+/// Register a (non-resident) credential on the connected security key and
+/// return its base64 credential id for the config. Requires a physical touch,
+/// and the key's PIN if one is set. Interactive: prompts for the PIN.
+pub fn register_yubikey() -> Result<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, fidokey::MakeCredentialArgsBuilder, verifier};
+
+    let device = FidoKeyHidFactory::create(&Cfg::init())
+        .map_err(|e| anyhow!("no FIDO2 security key found (or more than one connected): {e:?}"))?;
+
+    let pin = rpassword::prompt_password("YubiKey PIN (leave empty if the key has none): ")
+        .context("failed to read the PIN")?;
+    let pin = pin.trim();
+
+    let challenge = verifier::create_challenge();
+    let args = if pin.is_empty() {
+        MakeCredentialArgsBuilder::new(YUBIKEY_RP_ID, &challenge).build()
+    } else {
+        MakeCredentialArgsBuilder::new(YUBIKEY_RP_ID, &challenge)
+            .pin(pin)
+            .build()
+    };
+
+    println!("Touch your YubiKey to register...");
+    let attestation = device
+        .make_credential_with_args(&args)
+        .map_err(|e| anyhow!("registration failed (touch timed out or wrong PIN?): {e:?}"))?;
+
+    let verify = verifier::verify_attestation(YUBIKEY_RP_ID, &challenge, &attestation);
+    if !verify.is_success {
+        bail!("attestation verification failed");
+    }
+    Ok(STANDARD.encode(verify.credential_id))
 }
 
 /// One successful approval, timestamped on both clocks. `Instant` does not

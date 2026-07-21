@@ -38,5 +38,9 @@ secret_ids:
 #   master_password_env: TAPWARDEN_VW_MASTER_PASSWORD
 
 authorization:
-  mode: per_use        # per_use = biometric prompt every signature | grace = cache approval
+  mode: per_use        # per_use = prompt every signature | grace = cache approval
+  factor: touch_id     # touch_id (default) | yubikey (FIDO2 security-key touch)
   grace_seconds: 60    # only used when mode = grace
+  # For factor: yubikey, register once with `tapwarden register-yubikey` and add:
+  # yubikey:
+  #   credential_id: <base64 printed by register-yubikey>

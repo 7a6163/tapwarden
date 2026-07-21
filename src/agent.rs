@@ -11,8 +11,10 @@ use ssh_key::{Algorithm, PrivateKey, Signature};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-use crate::authorizer::{AuthContext, Authorizer, Biometric, Grace};
-use crate::config::{AuthMode, Backend, Config, CredentialSource};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+use crate::authorizer::{AuthContext, Authorizer, Biometric, Grace, YubikeyTouch};
+use crate::config::{AuthFactor, AuthMode, Backend, Config, CredentialSource};
 use crate::runtime_paths;
 use crate::secret_source::{BwsCredentials, BwsRest, SecretFetcher};
 use crate::vaultwarden::{VaultwardenFetcher, VwCredentials};
@@ -53,7 +55,7 @@ pub async fn probe_keys(config: &Config) -> Result<Vec<(Uuid, Result<String>)>> 
         .iter()
         .map(|s| Uuid::parse_str(s).with_context(|| format!("secret id `{s}` is not a UUID")))
         .collect::<Result<Vec<_>>>()?;
-    let authorizer = build_authorizer(config);
+    let authorizer = build_authorizer(config)?;
     let fetcher = build_fetcher(config, authorizer)?;
     let mut out = Vec::with_capacity(secret_ids.len());
     for id in secret_ids {
@@ -210,14 +212,26 @@ fn build_fetcher(
     }
 }
 
-fn build_authorizer(config: &Config) -> Arc<dyn Authorizer> {
-    match config.authorization.mode {
-        AuthMode::PerUse => Arc::new(Biometric),
+fn build_authorizer(config: &Config) -> Result<Arc<dyn Authorizer>> {
+    let factor: Box<dyn Authorizer> = match config.authorization.factor {
+        AuthFactor::TouchId => Box::new(Biometric),
+        AuthFactor::Yubikey => {
+            let yk = config.authorization.yubikey.as_ref().context(
+                "factor is yubikey but no credential is registered — run `tapwarden register-yubikey`",
+            )?;
+            let credential_id = STANDARD
+                .decode(&yk.credential_id)
+                .context("authorization.yubikey.credential_id is not valid base64")?;
+            Box::new(YubikeyTouch::new(credential_id))
+        }
+    };
+    Ok(match config.authorization.mode {
+        AuthMode::PerUse => Arc::from(factor),
         AuthMode::Grace => Arc::new(Grace::new(
-            Box::new(Biometric),
+            factor,
             Duration::from_secs(config.authorization.grace_seconds),
         )),
-    }
+    })
 }
 
 pub async fn run_foreground(config: Config) -> Result<()> {
@@ -229,7 +243,7 @@ pub async fn run_foreground(config: Config) -> Result<()> {
 
     // One authorizer instance gates both signatures and (for the keychain
     // credential source) backend credential reads — the latter always prompt.
-    let authorizer = build_authorizer(&config);
+    let authorizer = build_authorizer(&config)?;
     let service = Arc::new(KeyService::new(
         secret_ids,
         build_fetcher(&config, authorizer.clone())?,
