@@ -48,8 +48,9 @@ chmod 600 ~/.config/tapwarden/config.yaml
 ```
 
 Keys must be **Ed25519** in **OpenSSH format**
-(`-----BEGIN OPENSSH PRIVATE KEY-----`). Credentials never go in the config
-file — only the *names* of the env vars that hold them.
+(`-----BEGIN OPENSSH PRIVATE KEY-----`) — the modern key type; RSA/ECDSA are
+intentionally not supported. Credentials never go in the config file — only
+the *names* of the env vars that hold them.
 
 ### Backend A: Bitwarden Secrets Manager (cloud or official self-host)
 
