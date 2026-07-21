@@ -196,6 +196,14 @@ fn default_path() -> Result<PathBuf> {
         .join(CONFIG_REL))
 }
 
+/// The path `load` would read for the given optional `--config` override.
+pub fn resolved_path(explicit: Option<&str>) -> Result<PathBuf> {
+    match explicit {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => default_path(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

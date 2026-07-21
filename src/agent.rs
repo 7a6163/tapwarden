@@ -22,6 +22,47 @@ struct LoadedKey {
     comment: String,
 }
 
+/// Fetch one secret, decode it as an Ed25519 OpenSSH key, and derive its
+/// display comment. Shared by the running agent and `doctor --check-backend`.
+async fn load_key(fetcher: &dyn SecretFetcher, id: Uuid) -> Result<LoadedKey> {
+    let secret = fetcher.get(id).await?;
+    let key = PrivateKey::from_openssh(&secret.openssh_private_key)
+        .context("secret value is not an OpenSSH private key")?;
+    if key.algorithm() != Algorithm::Ed25519 {
+        bail!(
+            "secret \"{}\" holds a {} key — tapwarden serves Ed25519 keys only",
+            secret.name,
+            key.algorithm()
+        );
+    }
+    let comment = if key.comment().is_empty() {
+        secret.name
+    } else {
+        key.comment().to_string()
+    };
+    Ok(LoadedKey { key, comment })
+}
+
+/// Doctor helper: build the real backend fetcher and try to load every
+/// configured key, returning the resolved comment on success or the per-id
+/// error. With the keychain credential source this reads credentials behind
+/// the authorizer, so it may raise a Touch ID prompt.
+pub async fn probe_keys(config: &Config) -> Result<Vec<(Uuid, Result<String>)>> {
+    let secret_ids = config
+        .secret_ids
+        .iter()
+        .map(|s| Uuid::parse_str(s).with_context(|| format!("secret id `{s}` is not a UUID")))
+        .collect::<Result<Vec<_>>>()?;
+    let authorizer = build_authorizer(config);
+    let fetcher = build_fetcher(config, authorizer)?;
+    let mut out = Vec::with_capacity(secret_ids.len());
+    for id in secret_ids {
+        let comment = load_key(fetcher.as_ref(), id).await.map(|k| k.comment);
+        out.push((id, comment));
+    }
+    Ok(out)
+}
+
 /// Shared agent state: lazy in-memory key cache plus the two injected traits.
 /// Private keys live only in this struct — never on disk, in logs, or errors.
 struct KeyService {
@@ -46,22 +87,7 @@ impl KeyService {
     }
 
     async fn load_one(&self, id: Uuid) -> Result<LoadedKey> {
-        let secret = self.fetcher.get(id).await?;
-        let key = PrivateKey::from_openssh(&secret.openssh_private_key)
-            .context("secret value is not an OpenSSH private key")?;
-        if key.algorithm() != Algorithm::Ed25519 {
-            bail!(
-                "secret \"{}\" holds a {} key — tapwarden serves Ed25519 keys only",
-                secret.name,
-                key.algorithm()
-            );
-        }
-        let comment = if key.comment().is_empty() {
-            secret.name
-        } else {
-            key.comment().to_string()
-        };
-        Ok(LoadedKey { key, comment })
+        load_key(self.fetcher.as_ref(), id).await
     }
 
     /// Lazily fetch any not-yet-loaded secrets. A failure for one id is

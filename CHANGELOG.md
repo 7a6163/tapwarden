@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`tapwarden doctor`**: read-only diagnostics that check the config (load,
+  validity, `0600` perms), backend credentials presence, Touch ID
+  availability, the LaunchAgent load state, the agent socket (present and
+  answering), and the SSH `IdentityAgent`/`SSH_AUTH_SOCK` wiring. Prints a
+  `[ ok ]`/`[warn]`/`[fail]` checklist and exits non-zero on any failure.
+  `--check-backend` additionally fetches every configured key from the backend
+  end-to-end (needs network + credentials; keychain creds may prompt Touch ID).
+
 ## [0.1.4] - 2026-07-20
 
 ### Changed

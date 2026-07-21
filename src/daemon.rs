@@ -28,7 +28,7 @@ fn home() -> Result<PathBuf> {
     dirs::home_dir().context("unable to determine home directory")
 }
 
-fn plist_path() -> Result<PathBuf> {
+pub(crate) fn plist_path() -> Result<PathBuf> {
     Ok(home()?
         .join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist")))
@@ -36,8 +36,21 @@ fn plist_path() -> Result<PathBuf> {
 
 /// Logs live in `~/Library/Logs`, not the runtime dir — the runtime dir is
 /// tmpfs-ish and vanishes across reboots.
-fn log_path() -> Result<PathBuf> {
+pub(crate) fn log_path() -> Result<PathBuf> {
     Ok(home()?.join("Library/Logs/tapwarden.log"))
+}
+
+/// The LaunchAgent label, for diagnostics.
+pub(crate) fn label() -> &'static str {
+    LABEL
+}
+
+/// True when launchd currently has our service loaded (running or scheduled).
+/// `launchctl print <target>` exits non-zero when nothing is loaded there.
+pub(crate) fn is_loaded() -> bool {
+    launchctl(&["print", &service_target()])
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 fn gui_domain() -> String {

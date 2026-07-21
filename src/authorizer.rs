@@ -41,6 +41,20 @@ impl Authorizer for AlwaysAllow {
     }
 }
 
+/// Whether this platform can build the biometric policy tapwarden uses. This
+/// is a capability probe for `doctor` — it constructs the policy but never
+/// authenticates, so it raises no prompt. It confirms LocalAuthentication is
+/// available, not that a fingerprint is enrolled.
+pub fn biometrics_available() -> bool {
+    use robius_authentication::{BiometricStrength, PolicyBuilder};
+    PolicyBuilder::new()
+        .biometrics(Some(BiometricStrength::Strong))
+        .password(true)
+        .watch(true)
+        .build()
+        .is_some()
+}
+
 /// Biometric (Touch ID) approval via `robius-authentication` / LocalAuthentication.
 ///
 /// Uses `DeviceOwnerAuthentication` (biometrics + password + watch), so a failed

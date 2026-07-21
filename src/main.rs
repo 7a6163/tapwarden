@@ -5,6 +5,7 @@ mod agent;
 mod authorizer;
 mod config;
 mod daemon;
+mod doctor;
 mod keychain;
 mod runtime_paths;
 mod secret_source;
@@ -38,6 +39,17 @@ enum Commands {
     /// Interactive wizard: log in to Vaultwarden once, obtain the personal
     /// API key, pick the SSH keys to serve, and write the config file
     Setup,
+    /// Read-only diagnostics: config, credentials, LaunchAgent, socket, SSH
+    /// wiring, and Touch ID. Exits non-zero if any check fails.
+    Doctor {
+        /// Path to the config file
+        #[arg(long)]
+        config: Option<String>,
+        /// Also fetch the configured keys from the backend end-to-end
+        /// (needs network + credentials; keychain creds may prompt Touch ID)
+        #[arg(long)]
+        check_backend: bool,
+    },
     /// Stop the background agent (the LaunchAgent stays installed)
     Stop,
     /// Show the last lines of the agent log
@@ -63,6 +75,10 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Setup => setup::run().await?,
+        Commands::Doctor {
+            config,
+            check_backend,
+        } => doctor::run(config.as_deref(), check_backend).await?,
         Commands::Stop => daemon::stop()?,
         Commands::Logs => daemon::logs()?,
         Commands::Uninstall => daemon::uninstall()?,
