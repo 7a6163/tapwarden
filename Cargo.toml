@@ -1,6 +1,6 @@
 [package]
 name = "tapwarden"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.88.0" # time 0.3.47 (RUSTSEC-2026-0009 fix) requires 1.88
 description = "SSH agent backed by Bitwarden Secrets Manager with per-use biometric authorization"
