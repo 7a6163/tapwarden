@@ -12,6 +12,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::config::{Backend, Config, CredentialSource};
 use crate::runtime_paths;
@@ -186,15 +187,23 @@ pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
     })
     .with_context(|| format!("failed to set permissions on {}", plist.display()))?;
 
-    // Best-effort: bootstrap refuses to replace an already-loaded service, so
-    // clear any previous copy first. Failure here just means nothing was loaded.
-    let _ = launchctl(&["bootout", &service_target()]);
+    // bootstrap refuses to replace an already-loaded service. bootout returns
+    // before launchd always finishes removing it, so retry that transition.
+    let booted_out =
+        launchctl(&["bootout", &service_target()]).is_ok_and(|out| out.status.success());
 
     let plist_str = plist
         .to_str()
         .context("the LaunchAgent plist path is not valid UTF-8")?;
-    let out = launchctl(&["bootstrap", &gui_domain(), plist_str])?;
-    if !out.status.success() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let out = loop {
+        let out = launchctl(&["bootstrap", &gui_domain(), plist_str])?;
+        if out.status.success() || is_loaded() || !booted_out || Instant::now() >= deadline {
+            break out;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !out.status.success() && !is_loaded() {
         bail!(
             "launchctl bootstrap failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
