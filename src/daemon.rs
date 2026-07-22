@@ -77,9 +77,17 @@ fn xml_escape(s: &str) -> String {
 /// env, and credentials must not live in the plist. Env-credential configs
 /// (backend `bws`, or `credentials: env`) need `tapwarden start --fg` from a
 /// shell that exports them — or a hand-added EnvironmentVariables dict.
-fn render_plist(exe: &str, log: &str) -> String {
+fn render_plist(exe: &str, log: &str, config_path: Option<&str>) -> String {
     let exe = xml_escape(exe);
     let log = xml_escape(log);
+    let config_args = config_path
+        .map(|path| {
+            format!(
+                "\n\t\t<string>--config</string>\n\t\t<string>{}</string>",
+                xml_escape(path)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -92,6 +100,7 @@ fn render_plist(exe: &str, log: &str) -> String {
 		<string>{exe}</string>
 		<string>start</string>
 		<string>--fg</string>
+		{config_args}
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -129,7 +138,7 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
 }
 
 /// Install the LaunchAgent plist and (re)start the agent under launchd.
-pub fn start(config: &Config) -> Result<()> {
+pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
     if uses_env_credentials(config) {
         eprintln!(
             "warning: this config resolves credentials from env vars, which launchd does not \
@@ -143,6 +152,17 @@ pub fn start(config: &Config) -> Result<()> {
     let exe = exe
         .to_str()
         .context("the tapwarden executable path is not valid UTF-8")?;
+    let config_path = config_path
+        .map(std::fs::canonicalize)
+        .transpose()
+        .context("failed to resolve the config file path")?;
+    let config_path = config_path
+        .as_deref()
+        .map(|path| {
+            path.to_str()
+                .context("the config file path is not valid UTF-8")
+        })
+        .transpose()?;
     let plist = plist_path()?;
     let log = log_path()?;
     let log = log
@@ -158,7 +178,7 @@ pub fn start(config: &Config) -> Result<()> {
     crate::runtime_paths::reject_symlink(&plist)?;
     crate::runtime_paths::reject_symlink(log_path()?.as_path())?;
     // 0644 is fine: the plist holds only the exe path, nothing sensitive.
-    std::fs::write(&plist, render_plist(exe, log))
+    std::fs::write(&plist, render_plist(exe, log, config_path))
         .with_context(|| format!("failed to write {}", plist.display()))?;
     std::fs::set_permissions(&plist, {
         use std::os::unix::fs::PermissionsExt;
@@ -278,6 +298,7 @@ mod tests {
         let plist = render_plist(
             "/Users/z a/dev & test/<tapwarden>",
             "/Users/z a/Library/Logs/tapwarden.log",
+            None,
         );
         assert!(
             plist.contains("<string>/Users/z a/dev &amp; test/&lt;tapwarden&gt;</string>"),
@@ -288,7 +309,7 @@ mod tests {
 
     #[test]
     fn plist_has_label_args_restart_policy_and_no_env() {
-        let plist = render_plist("/usr/local/bin/tapwarden", "/tmp/tapwarden.log");
+        let plist = render_plist("/usr/local/bin/tapwarden", "/tmp/tapwarden.log", None);
         assert!(plist.contains("<string>com.tapwarden.agent</string>"));
         assert!(plist.contains("<string>start</string>"));
         assert!(plist.contains("<string>--fg</string>"));
@@ -300,6 +321,17 @@ mod tests {
             !plist.contains("EnvironmentVariables"),
             "the plist must never carry env values or credentials"
         );
+    }
+
+    #[test]
+    fn plist_preserves_and_escapes_explicit_config_path() {
+        let plist = render_plist(
+            "/usr/local/bin/tapwarden",
+            "/tmp/tapwarden.log",
+            Some("/Users/z a/config & test.yaml"),
+        );
+        assert!(plist.contains("<string>--config</string>"));
+        assert!(plist.contains("<string>/Users/z a/config &amp; test.yaml</string>"));
     }
 
     #[test]

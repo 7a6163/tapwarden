@@ -87,6 +87,9 @@ tapwarden store-token   # paste the access token; it is verified and saved to th
 The token is then read lazily on first use, behind the same Touch ID (or
 YubiKey) gate as signing.
 
+Self-hosted BWS endpoints must use HTTPS. Plain HTTP is accepted only for
+`localhost`, `127.0.0.1`, or `::1` during local development.
+
 ### Backend B: Vaultwarden (self-hosted)
 
 Vaultwarden does not implement Secrets Manager (proprietary-licensed), so tapwarden
@@ -216,7 +219,7 @@ switch the factor:
 tapwarden register-yubikey   # insert the key, enter its PIN if it has one, then touch
 ```
 
-It prints a `credential_id`; add it to the config:
+It prints the credential id and verifier public key; add both to the config:
 
 ```yaml
 authorization:
@@ -224,6 +227,9 @@ authorization:
   factor: yubikey            # touch_id (default) | yubikey
   yubikey:
     credential_id: <base64 printed by register-yubikey>
+    public_key:
+      algorithm: es256
+      bytes: <base64 printed by register-yubikey>
 ```
 
 Each `ssh` signature (and every keychain credential unlock) then needs a
@@ -235,8 +241,10 @@ ssh somehost                 # ← touch your YubiKey to sign
 ```
 
 Notes: the key's **PIN is only needed at registration** (touch-only afterwards);
-the `credential_id` is just a handle, useless without the physical key; connect
-exactly one FIDO2 key when registering or signing.
+the credential id and public key are not secrets; connect exactly one FIDO2 key
+when registering or signing. YubiKey configs created by v0.2.0 must run
+`tapwarden register-yubikey` again so assertions can be cryptographically
+verified.
 
 ## Verifying your setup
 

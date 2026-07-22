@@ -13,6 +13,8 @@ pub enum AuthContext<'a> {
     /// One SSH signature with the named key.
     Sign {
         key_comment: &'a str,
+        /// Stable SHA-256 public-key fingerprint used to scope grace windows.
+        key_fingerprint: &'a str,
         /// Length of the data being signed; not shown in the prompt yet.
         #[allow(dead_code)]
         data_len: usize,
@@ -122,18 +124,46 @@ pub const YUBIKEY_RP_ID: &str = "tapwarden";
 /// tapped — the YubiKey analog of the Touch ID gate.
 pub struct YubikeyTouch {
     credential_id: Vec<u8>,
+    public_key: ctap_hid_fido2::public_key::PublicKey,
 }
 
 impl YubikeyTouch {
-    pub fn new(credential_id: Vec<u8>) -> Self {
-        Self { credential_id }
+    pub fn new(credential_id: Vec<u8>, public_key: ctap_hid_fido2::public_key::PublicKey) -> Self {
+        Self {
+            credential_id,
+            public_key,
+        }
     }
+}
+
+fn yubikey_credential_matches(expected: &[u8], returned: &[u8]) -> bool {
+    // CTAP allows omitting the descriptor when the allow-list has one entry.
+    // The verified signature still binds the response to the registered key.
+    returned.is_empty() || returned == expected
+}
+
+fn yubikey_assertion_is_valid(
+    credential_id: &[u8],
+    public_key: &ctap_hid_fido2::public_key::PublicKey,
+    challenge: &[u8],
+    assertion: &ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion,
+) -> bool {
+    yubikey_credential_matches(credential_id, &assertion.credential_id)
+        && assertion.flags.user_present_result
+        && !assertion.flags.attested_credential_data_included
+        && ctap_hid_fido2::verifier::verify_assertion(
+            YUBIKEY_RP_ID,
+            public_key,
+            challenge,
+            assertion,
+        )
 }
 
 #[async_trait]
 impl Authorizer for YubikeyTouch {
     async fn approve(&self, _ctx: &AuthContext<'_>) -> Result<bool> {
         let credential_id = self.credential_id.clone();
+        let public_key = self.public_key.clone();
         // Blocking HID I/O: keep it off the async runtime, like Biometric.
         tokio::task::spawn_blocking(move || -> Result<bool> {
             use ctap_hid_fido2::{
@@ -144,10 +174,20 @@ impl Authorizer for YubikeyTouch {
             })?;
             let challenge = verifier::create_challenge();
             let args = GetAssertionArgsBuilder::new(YUBIKEY_RP_ID, &challenge)
+                .without_pin_and_uv()
                 .credential_id(&credential_id)
                 .build();
             match device.get_assertion_with_args(&args) {
-                Ok(assertions) => Ok(!assertions.is_empty()),
+                Ok(assertions) => Ok(matches!(
+                    assertions.as_slice(),
+                    [assertion]
+                        if yubikey_assertion_is_valid(
+                            &credential_id,
+                            &public_key,
+                            &challenge,
+                            assertion
+                        )
+                )),
                 // A timeout, wrong key, or no touch is a denial, not a crash:
                 // the signature simply fails, like a canceled Touch ID prompt.
                 Err(_) => Ok(false),
@@ -164,12 +204,21 @@ pub fn yubikey_present() -> bool {
     FidoKeyHidFactory::create(&Cfg::init()).is_ok()
 }
 
+pub struct RegisteredYubikey {
+    pub credential_id: String,
+    pub public_key_algorithm: &'static str,
+    pub public_key_bytes: String,
+}
+
 /// Register a (non-resident) credential on the connected security key and
-/// return its base64 credential id for the config. Requires a physical touch,
-/// and the key's PIN if one is set. Interactive: prompts for the PIN.
-pub fn register_yubikey() -> Result<String> {
+/// return its credential id and verifier public key for the config. Requires
+/// a physical touch, and the key's PIN if one is set.
+pub fn register_yubikey() -> Result<RegisteredYubikey> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, fidokey::MakeCredentialArgsBuilder, verifier};
+    use ctap_hid_fido2::{
+        Cfg, FidoKeyHidFactory, fidokey::MakeCredentialArgsBuilder, public_key::PublicKeyType,
+        verifier,
+    };
 
     let device = FidoKeyHidFactory::create(&Cfg::init())
         .map_err(|e| anyhow!("no FIDO2 security key found (or more than one connected): {e:?}"))?;
@@ -196,7 +245,19 @@ pub fn register_yubikey() -> Result<String> {
     if !verify.is_success {
         bail!("attestation verification failed");
     }
-    Ok(STANDARD.encode(verify.credential_id))
+    let public_key_algorithm = match verify.credential_public_key.key_type {
+        PublicKeyType::Ecdsa256 => "es256",
+        PublicKeyType::Ed25519 => "ed25519",
+        _ => bail!("registered credential uses an unsupported public-key algorithm"),
+    };
+    if verify.credential_public_key.der.is_empty() {
+        bail!("registered credential returned an empty public key");
+    }
+    Ok(RegisteredYubikey {
+        credential_id: STANDARD.encode(verify.credential_id),
+        public_key_algorithm,
+        public_key_bytes: STANDARD.encode(verify.credential_public_key.der),
+    })
 }
 
 /// One successful approval, timestamped on both clocks. `Instant` does not
@@ -247,7 +308,10 @@ impl Authorizer for Grace {
     async fn approve(&self, ctx: &AuthContext<'_>) -> Result<bool> {
         // INVARIANT: only signatures ride the grace window. A credential
         // unlock always reaches the inner prompt and is never cached.
-        let AuthContext::Sign { key_comment, .. } = ctx else {
+        let AuthContext::Sign {
+            key_fingerprint, ..
+        } = ctx
+        else {
             return self.inner.approve(ctx).await;
         };
 
@@ -257,7 +321,7 @@ impl Authorizer for Grace {
             .last
             .lock()
             .expect("grace lock poisoned")
-            .get(*key_comment)
+            .get(*key_fingerprint)
             .is_some_and(|approval| approval.within(self.window));
         if within_window {
             return Ok(true);
@@ -268,7 +332,7 @@ impl Authorizer for Grace {
             self.last
                 .lock()
                 .expect("grace lock poisoned")
-                .insert(key_comment.to_string(), Approval::now());
+                .insert(key_fingerprint.to_string(), Approval::now());
         }
         Ok(approved)
     }
@@ -297,6 +361,7 @@ mod tests {
     fn ctx() -> AuthContext<'static> {
         AuthContext::Sign {
             key_comment: "test@key",
+            key_fingerprint: "SHA256:key-a",
             data_len: 32,
         }
     }
@@ -316,6 +381,42 @@ mod tests {
             }),
             calls,
         )
+    }
+
+    #[test]
+    fn yubikey_assertion_requires_matching_credential_and_user_presence() {
+        use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion;
+        use ctap_hid_fido2::public_key::PublicKey;
+
+        let credential_id = b"registered";
+        let public_key = PublicKey::default();
+        let challenge = [0u8; 32];
+
+        let mut assertion = Assertion {
+            credential_id: b"different".to_vec(),
+            ..Default::default()
+        };
+        assert!(!yubikey_assertion_is_valid(
+            credential_id,
+            &public_key,
+            &challenge,
+            &assertion
+        ));
+
+        assertion.credential_id = credential_id.to_vec();
+        assert!(!yubikey_assertion_is_valid(
+            credential_id,
+            &public_key,
+            &challenge,
+            &assertion
+        ));
+    }
+
+    #[test]
+    fn yubikey_credential_descriptor_may_be_omitted() {
+        assert!(yubikey_credential_matches(b"registered", b"registered"));
+        assert!(yubikey_credential_matches(b"registered", b""));
+        assert!(!yubikey_credential_matches(b"registered", b"different"));
     }
 
     #[tokio::test]
@@ -354,7 +455,8 @@ mod tests {
 
         assert!(grace.approve(&ctx()).await.unwrap());
         let other = AuthContext::Sign {
-            key_comment: "other@key",
+            key_comment: "test@key",
+            key_fingerprint: "SHA256:key-b",
             data_len: 32,
         };
         assert!(grace.approve(&other).await.unwrap());
@@ -441,6 +543,7 @@ mod tests {
         let result = Biometric
             .approve(&AuthContext::Sign {
                 key_comment: "m0-poc@tapwarden",
+                key_fingerprint: "SHA256:m0-poc",
                 data_len: 0,
             })
             .await;

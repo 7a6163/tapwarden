@@ -44,3 +44,6 @@ authorization:
   # For factor: yubikey, register once with `tapwarden register-yubikey` and add:
   # yubikey:
   #   credential_id: <base64 printed by register-yubikey>
+  #   public_key:
+  #     algorithm: es256
+  #     bytes: <base64 printed by register-yubikey>

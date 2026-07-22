@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- YubiKey assertions now require a matching credential id, user-presence flag,
+  RP id, challenge, and valid signature under the public key saved at
+  registration. Existing v0.2.0 YubiKey configs must register again once.
+- Explicit `start --config` paths are preserved in the LaunchAgent instead of
+  silently falling back to the default config.
+- BWS custom endpoints must use HTTPS; plain HTTP is limited to loopback.
+- Grace-mode approvals are scoped by SHA-256 public-key fingerprint instead of
+  the non-unique key comment.
+
 ## [0.2.0] - 2026-07-21
 
 ### Added

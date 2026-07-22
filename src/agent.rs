@@ -7,11 +7,9 @@ use signature::Signer as _;
 use ssh_agent_lib::agent::{Session, listen};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
-use ssh_key::{Algorithm, PrivateKey, Signature};
+use ssh_key::{Algorithm, HashAlg, PrivateKey, Signature};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
-
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::authorizer::{AuthContext, Authorizer, Biometric, Grace, YubikeyTouch};
 use crate::config::{AuthFactor, AuthMode, Backend, Config, CredentialSource};
@@ -22,6 +20,7 @@ use crate::vaultwarden::{VaultwardenFetcher, VwCredentials};
 struct LoadedKey {
     key: PrivateKey,
     comment: String,
+    fingerprint: String,
 }
 
 /// Fetch one secret, decode it as an Ed25519 OpenSSH key, and derive its
@@ -42,7 +41,12 @@ async fn load_key(fetcher: &dyn SecretFetcher, id: Uuid) -> Result<LoadedKey> {
     } else {
         key.comment().to_string()
     };
-    Ok(LoadedKey { key, comment })
+    let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+    Ok(LoadedKey {
+        key,
+        comment,
+        fingerprint,
+    })
 }
 
 /// Doctor helper: build the real backend fetcher and try to load every
@@ -129,19 +133,24 @@ impl KeyService {
     async fn sign(&self, request: SignRequest) -> Result<Signature, AgentError> {
         // Clone the key out and drop the lock so a pending Touch ID prompt
         // doesn't block identity listing from other clients.
-        let (key, comment) = {
+        let (key, comment, fingerprint) = {
             let keys = self.loaded_keys().await;
             let entry = keys
                 .values()
                 .find(|k| k.key.public_key().key_data() == request.credential.key_data())
                 .ok_or(AgentError::Failure)?;
-            (entry.key.clone(), entry.comment.clone())
+            (
+                entry.key.clone(),
+                entry.comment.clone(),
+                entry.fingerprint.clone(),
+            )
         };
 
         // INVARIANT: every sign passes through the Authorizer before the key
         // is used — this gate is tapwarden's whole point.
         let ctx = AuthContext::Sign {
             key_comment: &comment,
+            key_fingerprint: &fingerprint,
             data_len: request.data.len(),
         };
         let approved = self
@@ -219,10 +228,8 @@ fn build_authorizer(config: &Config) -> Result<Arc<dyn Authorizer>> {
             let yk = config.authorization.yubikey.as_ref().context(
                 "factor is yubikey but no credential is registered — run `tapwarden register-yubikey`",
             )?;
-            let credential_id = STANDARD
-                .decode(&yk.credential_id)
-                .context("authorization.yubikey.credential_id is not valid base64")?;
-            Box::new(YubikeyTouch::new(credential_id))
+            let (credential_id, public_key) = yk.verifier()?;
+            Box::new(YubikeyTouch::new(credential_id, public_key))
         }
     };
     Ok(match config.authorization.mode {
@@ -394,6 +401,27 @@ evIm7upQr6L5g7GowOCRAAAAE3VuaXQtdGVzdEB0YXB3YXJkZW4BAg==
             KeyService::new(vec![id], Box::new(fetcher), authorizer),
             request,
         )
+    }
+
+    #[test]
+    fn yubikey_authorizer_rejects_malformed_public_key() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+secret_ids: [00000000-0000-0000-0000-000000000000]
+authorization:
+  factor: yubikey
+  yubikey:
+    credential_id: AA==
+    public_key:
+      algorithm: es256
+      bytes: AA==
+"#,
+        )
+        .unwrap();
+        let err = build_authorizer(&config)
+            .err()
+            .expect("malformed verifier public key must fail closed");
+        assert!(err.to_string().contains("valid ES256"), "{err:#}");
     }
 
     #[tokio::test]

@@ -301,19 +301,47 @@ enum PendingToken {
 /// `bitwarden.com` (default) / `bitwarden.eu` / bare self-hosted host →
 /// `https://identity.<host>` + `https://api.<host>`. A full URL (self-hosted
 /// behind one origin) mirrors the bws CLI's `server_base`: `<base>/identity` +
-/// `<base>/api`.
-fn service_urls(server_endpoint: Option<&str>) -> (String, String) {
+/// `<base>/api`. Cleartext HTTP is accepted only for loopback development.
+fn service_urls(server_endpoint: Option<&str>) -> Result<(String, String)> {
     let endpoint = server_endpoint
         .unwrap_or("bitwarden.com")
         .trim_end_matches('/');
     if endpoint.contains("://") {
-        (format!("{endpoint}/identity"), format!("{endpoint}/api"))
+        let url =
+            reqwest::Url::parse(endpoint).context("BWS server_endpoint is not a valid URL")?;
+        if url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
+            bail!("BWS server_endpoint must be a base URL without a query or fragment");
+        }
+        let secure = url.scheme() == "https";
+        let loopback_http = url.scheme() == "http"
+            && url
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
+        if !secure && !loopback_http {
+            bail!("BWS server_endpoint must use https:// (http:// is allowed for localhost only)");
+        }
+        Ok((format!("{endpoint}/identity"), format!("{endpoint}/api")))
     } else {
-        (
+        let host_url = reqwest::Url::parse(&format!("https://{endpoint}"))
+            .context("BWS server_endpoint is not a valid host")?;
+        if host_url.host_str().is_none()
+            || host_url.path() != "/"
+            || !host_url.username().is_empty()
+            || host_url.password().is_some()
+            || host_url.query().is_some()
+            || host_url.fragment().is_some()
+        {
+            bail!("BWS server_endpoint must be a bare host or full base URL");
+        }
+        Ok((
             format!("https://identity.{endpoint}"),
             format!("https://api.{endpoint}"),
-        )
+        ))
     }
+}
+
+pub(crate) fn validate_bws_server_endpoint(server_endpoint: Option<&str>) -> Result<()> {
+    service_urls(server_endpoint).map(|_| ())
 }
 
 impl BwsRest {
@@ -322,7 +350,7 @@ impl BwsRest {
         server_endpoint: Option<&str>,
         gate: Arc<dyn Authorizer>,
     ) -> Result<Self> {
-        let (identity_url, api_url) = service_urls(server_endpoint);
+        let (identity_url, api_url) = service_urls(server_endpoint)?;
         let pending = match credentials {
             BwsCredentials::Env(token) => PendingToken::Parsed(AccessToken::parse(&token)?),
             BwsCredentials::Keychain => PendingToken::Keychain,
@@ -578,14 +606,14 @@ mod tests {
     #[test]
     fn derives_service_urls() {
         assert_eq!(
-            service_urls(None),
+            service_urls(None).unwrap(),
             (
                 "https://identity.bitwarden.com".into(),
                 "https://api.bitwarden.com".into()
             )
         );
         assert_eq!(
-            service_urls(Some("bitwarden.eu")),
+            service_urls(Some("bitwarden.eu")).unwrap(),
             (
                 "https://identity.bitwarden.eu".into(),
                 "https://api.bitwarden.eu".into()
@@ -593,12 +621,20 @@ mod tests {
         );
         // Full URL → bws-CLI-style path-based routing.
         assert_eq!(
-            service_urls(Some("https://vault.example.com/")),
+            service_urls(Some("https://vault.example.com/")).unwrap(),
             (
                 "https://vault.example.com/identity".into(),
                 "https://vault.example.com/api".into()
             )
         );
+        assert!(service_urls(Some("http://vault.example.com")).is_err());
+        assert!(service_urls(Some("ftp://vault.example.com")).is_err());
+        assert!(service_urls(Some("http://localhost:8080")).is_ok());
+        assert!(service_urls(Some("http://127.0.0.1:8080")).is_ok());
+        assert!(service_urls(Some("http://[::1]:8080")).is_ok());
+        assert!(service_urls(Some("")).is_err());
+        assert!(service_urls(Some("vault.example.com/path")).is_err());
+        assert!(service_urls(Some("https://vault.example.com?query")).is_err());
     }
 
     /// Real-BWS integration test. Run explicitly with:

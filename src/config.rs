@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -140,6 +141,62 @@ pub enum AuthFactor {
 pub struct YubikeyConfig {
     /// Base64 credential id returned at registration.
     pub credential_id: String,
+    /// Public key needed to verify every assertion from the registered key.
+    /// Optional only so legacy configs produce a clear re-registration error.
+    #[serde(default)]
+    pub public_key: Option<YubikeyPublicKey>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct YubikeyPublicKey {
+    pub algorithm: YubikeyPublicKeyAlgorithm,
+    /// Base64 verifier key bytes returned at registration.
+    pub bytes: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YubikeyPublicKeyAlgorithm {
+    Es256,
+    Ed25519,
+}
+
+impl YubikeyConfig {
+    pub(crate) fn verifier(&self) -> Result<(Vec<u8>, ctap_hid_fido2::public_key::PublicKey)> {
+        let credential_id = STANDARD
+            .decode(&self.credential_id)
+            .context("authorization.yubikey.credential_id is not valid base64")?;
+        if credential_id.is_empty() {
+            bail!("authorization.yubikey.credential_id must not be empty");
+        }
+
+        let public_key = self.public_key.as_ref().context(
+            "authorization.yubikey.public_key is missing — run `tapwarden register-yubikey` again",
+        )?;
+        let public_key_bytes = STANDARD
+            .decode(&public_key.bytes)
+            .context("authorization.yubikey.public_key.bytes is not valid base64")?;
+        let public_key_type = match public_key.algorithm {
+            YubikeyPublicKeyAlgorithm::Es256 => {
+                if public_key_bytes.len() != 65 || public_key_bytes[0] != 0x04 {
+                    bail!("authorization.yubikey.public_key.bytes is not a valid ES256 public key");
+                }
+                ctap_hid_fido2::public_key::PublicKeyType::Ecdsa256
+            }
+            YubikeyPublicKeyAlgorithm::Ed25519 => {
+                if public_key_bytes.len() != 32 {
+                    bail!(
+                        "authorization.yubikey.public_key.bytes is not a valid Ed25519 public key"
+                    );
+                }
+                ctap_hid_fido2::public_key::PublicKeyType::Ed25519
+            }
+        };
+        Ok((
+            credential_id,
+            ctap_hid_fido2::public_key::PublicKey::with_der(&public_key_bytes, public_key_type),
+        ))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
@@ -223,11 +280,14 @@ impl Config {
         if self.backend == Backend::Vaultwarden && self.vaultwarden.is_none() {
             bail!("backend is vaultwarden but the `vaultwarden` config section is missing");
         }
-        if self.authorization.factor == AuthFactor::Yubikey && self.authorization.yubikey.is_none()
-        {
-            bail!(
-                "authorization.factor is yubikey but no credential is registered — run `tapwarden register-yubikey`"
-            );
+        if self.backend == Backend::Bws {
+            crate::secret_source::validate_bws_server_endpoint(self.server_endpoint.as_deref())?;
+        }
+        if self.authorization.factor == AuthFactor::Yubikey {
+            let yubikey = self.authorization.yubikey.as_ref().context(
+                "authorization.factor is yubikey but no credential is registered — run `tapwarden register-yubikey`",
+            )?;
+            yubikey.verifier()?;
         }
         Ok(())
     }
@@ -357,5 +417,67 @@ mod tests {
             err.to_string().contains("does not exist"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn legacy_yubikey_config_without_public_key_fails_closed() {
+        let yaml = format!(
+            "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: AA==\n"
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("assertions cannot be verified without the registered public key");
+        assert!(err.to_string().contains("register-yubikey"), "{err:#}");
+    }
+
+    #[test]
+    fn yubikey_public_key_config_parses() {
+        for algorithm in ["es256", "ed25519"] {
+            let mut key = vec![0; if algorithm == "es256" { 65 } else { 32 }];
+            if algorithm == "es256" {
+                key[0] = 0x04;
+            }
+            let key = STANDARD.encode(key);
+            let yaml = format!(
+                "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: AA==\n    public_key:\n      algorithm: {algorithm}\n      bytes: {key}\n"
+            );
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_yubikey_verifier_fails_before_agent_installation() {
+        for (credential_id, key) in [
+            ("not-base64", STANDARD.encode([0x04; 65])),
+            ("AA==", "not-base64".into()),
+            ("AA==", STANDARD.encode([0x04; 64])),
+        ] {
+            let yaml = format!(
+                "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: {credential_id}\n    public_key:\n      algorithm: es256\n      bytes: {key}\n"
+            );
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate()
+                .expect_err("malformed verifier material must fail config validation");
+        }
+    }
+
+    #[test]
+    fn bws_remote_http_endpoint_fails_before_agent_installation() {
+        let yaml = format!("{MINIMAL_YAML}server_endpoint: http://vault.example.com\n");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("remote BWS endpoints must never use cleartext HTTP");
+        assert!(err.to_string().contains("https://"), "{err:#}");
+    }
+
+    #[test]
+    fn empty_bws_endpoint_fails_before_agent_installation() {
+        let yaml = format!("{MINIMAL_YAML}server_endpoint: ''\n");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        cfg.validate()
+            .expect_err("empty BWS endpoint must fail config validation");
     }
 }

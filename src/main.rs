@@ -78,18 +78,21 @@ async fn main() -> Result<()> {
             if fg {
                 agent::run_foreground(cfg).await?;
             } else {
-                daemon::start(&cfg)?;
+                daemon::start(&cfg, config.as_deref())?;
             }
         }
         Commands::Setup => setup::run().await?,
         Commands::StoreToken => setup::store_bws_token()?,
         Commands::RegisterYubikey => {
-            let credential_id = authorizer::register_yubikey()?;
+            let registered = authorizer::register_yubikey()?;
             println!("\nRegistered. Add this to ~/.config/tapwarden/config.yaml:\n");
             println!("authorization:");
             println!("  factor: yubikey");
             println!("  yubikey:");
-            println!("    credential_id: {credential_id}");
+            println!("    credential_id: {}", registered.credential_id);
+            println!("    public_key:");
+            println!("      algorithm: {}", registered.public_key_algorithm);
+            println!("      bytes: {}", registered.public_key_bytes);
         }
         Commands::Doctor {
             config,
