@@ -1,5 +1,7 @@
 # tapwarden
 
+[![codecov](https://codecov.io/gh/7a6163/tapwarden/graph/badge.svg)](https://codecov.io/gh/7a6163/tapwarden)
+
 An SSH agent that serves keys from **Bitwarden Secrets Manager** or a
 **self-hosted Vaultwarden** and requires a **physical tap — Touch ID or a
 YubiKey — to authorize every signature** — 1Password's per-use approval UX, on

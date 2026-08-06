@@ -1,0 +1,10 @@
+# Coverage is informational: the Touch ID / keychain / live-server paths are
+# #[ignore]d in CI, so a coverage drop must not block a PR.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
