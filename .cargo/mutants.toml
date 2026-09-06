@@ -1,7 +1,7 @@
 # cargo-mutants: does the suite actually *catch* a broken change, or only run
 # the line? Only code the offline suite can drive is worth mutating — hardware
-# prompts, launchd, and the real Keychain would report every mutant as missed
-# without telling us anything.
+# prompts, the real Keychain, and the process entry point would report every
+# mutant as missed without telling us anything.
 #
 # The patterns match the whole mutant description ("<file>:<line>:<col>: <what>"),
 # so each one is anchored on the file it applies to.
@@ -14,11 +14,15 @@ exclude_globs = [
 exclude_re = [
     # Presence factors: these need a finger or a physical security key.
     "src/authorizer\\.rs:.*\\b(Biometric|YubikeyTouch|register_yubikey|biometrics_available|yubikey_present)\\b",
-    # launchd lifecycle and the log reader: driving these would install, boot
-    # out, or tail the real background agent.
-    "src/daemon\\.rs:.*\\b(start|stop|uninstall|logs|is_loaded|launchctl|home)\\b",
-    # Binds the real agent socket / waits for process signals.
-    "src/agent\\.rs:.*\\b(run_foreground|shutdown_signal)\\b",
+    # The process entry point: it parses argv and delegates to `run`, which is
+    # what the tests drive. Nothing can invoke `main` itself.
+    "src/main\\.rs:.*\\bmain\\b",
+    # Thin adapters onto the real world: each one only builds `Launchd::real()`
+    # (or resolves the real socket path) and delegates to the `*_in` / `serve`
+    # function that holds the logic and *is* tested. Driving these would mean
+    # booting out the user's actual agent.
+    "src/daemon\\.rs:.*\\b(launchctl|home|start|stop|uninstall|logs|is_loaded)\\b",
+    "src/agent\\.rs:.*\\brun_foreground\\b",
     # Wizard entry points: they read stdin and the terminal password prompt.
     "src/setup\\.rs:.*\\b(run|store_bws_token|prompt)\\b",
 ]

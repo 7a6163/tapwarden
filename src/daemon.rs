@@ -19,6 +19,8 @@ use crate::runtime_paths;
 
 const LABEL: &str = "com.tapwarden.agent";
 const LOG_TAIL_LINES: usize = 50;
+/// How long `start` retries `bootstrap` while launchd finishes a `bootout`.
+const BOOTSTRAP_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
 /// `stop` when launchd has nothing loaded under our label. Static by design:
 /// launchctl's non-zero exits don't distinguish "not loaded" from much else,
@@ -46,12 +48,43 @@ pub(crate) fn label() -> &'static str {
     LABEL
 }
 
-/// True when launchd currently has our service loaded (running or scheduled).
-/// `launchctl print <target>` exits non-zero when nothing is loaded there.
+/// Everything the lifecycle commands touch outside their own logic: the plist
+/// they write, the log they read, and the `launchctl` invocation. Injected so
+/// the bootstrap retry — the logic behind the 0.2.2 fix — can be exercised
+/// without installing a real LaunchAgent or booting out the running one.
+pub(crate) struct Launchd<'a> {
+    plist: PathBuf,
+    log: PathBuf,
+    run: &'a dyn Fn(&[&str]) -> Result<std::process::Output>,
+    /// How long `start` keeps retrying `bootstrap` while launchd finishes a
+    /// `bootout`. A field so the give-up path can be tested in milliseconds
+    /// instead of making the suite wait out the real budget.
+    retry_budget: Duration,
+}
+
+impl Launchd<'_> {
+    fn real() -> Result<Self> {
+        Ok(Self {
+            plist: plist_path()?,
+            log: log_path()?,
+            run: &launchctl,
+            retry_budget: BOOTSTRAP_RETRY_BUDGET,
+        })
+    }
+
+    /// True when launchd currently has our service loaded (running or
+    /// scheduled). `launchctl print <target>` exits non-zero when nothing is
+    /// loaded there.
+    fn is_loaded(&self) -> bool {
+        (self.run)(&["print", &service_target()])
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// True when launchd currently has our service loaded. For `doctor`.
 pub(crate) fn is_loaded() -> bool {
-    launchctl(&["print", &service_target()])
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    Launchd::real().is_ok_and(|launchd| launchd.is_loaded())
 }
 
 fn gui_domain() -> String {
@@ -140,6 +173,10 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
 
 /// Install the LaunchAgent plist and (re)start the agent under launchd.
 pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
+    start_in(&Launchd::real()?, config, config_path)
+}
+
+fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -> Result<()> {
     if uses_env_credentials(config) {
         eprintln!(
             "warning: this config resolves credentials from env vars, which launchd does not \
@@ -164,9 +201,9 @@ pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
                 .context("the config file path is not valid UTF-8")
         })
         .transpose()?;
-    let plist = plist_path()?;
-    let log = log_path()?;
-    let log = log
+    let plist = launchd.plist.as_path();
+    let log = launchd
+        .log
         .to_str()
         .context("the log file path is not valid UTF-8")?;
 
@@ -176,12 +213,12 @@ pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     // Neither target may be a pre-planted symlink: launchd would append the
     // agent's stdout/stderr through the log path, and we write the plist.
-    crate::runtime_paths::reject_symlink(&plist)?;
-    crate::runtime_paths::reject_symlink(log_path()?.as_path())?;
+    crate::runtime_paths::reject_symlink(plist)?;
+    crate::runtime_paths::reject_symlink(&launchd.log)?;
     // 0644 is fine: the plist holds only the exe path, nothing sensitive.
-    std::fs::write(&plist, render_plist(exe, log, config_path))
+    std::fs::write(plist, render_plist(exe, log, config_path))
         .with_context(|| format!("failed to write {}", plist.display()))?;
-    std::fs::set_permissions(&plist, {
+    std::fs::set_permissions(plist, {
         use std::os::unix::fs::PermissionsExt;
         std::fs::Permissions::from_mode(0o644)
     })
@@ -190,27 +227,28 @@ pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
     // bootstrap refuses to replace an already-loaded service. bootout returns
     // before launchd always finishes removing it, so retry that transition.
     let booted_out =
-        launchctl(&["bootout", &service_target()]).is_ok_and(|out| out.status.success());
+        (launchd.run)(&["bootout", &service_target()]).is_ok_and(|out| out.status.success());
 
     let plist_str = plist
         .to_str()
         .context("the LaunchAgent plist path is not valid UTF-8")?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + launchd.retry_budget;
     let out = loop {
-        let out = launchctl(&["bootstrap", &gui_domain(), plist_str])?;
-        if out.status.success() || is_loaded() || !booted_out || Instant::now() >= deadline {
+        let out = (launchd.run)(&["bootstrap", &gui_domain(), plist_str])?;
+        if out.status.success() || launchd.is_loaded() || !booted_out || Instant::now() >= deadline
+        {
             break out;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    if !out.status.success() && !is_loaded() {
+    if !out.status.success() && !launchd.is_loaded() {
         bail!(
             "launchctl bootstrap failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     // RunAtLoad already started it; kickstart -k guarantees a fresh instance.
-    let out = launchctl(&["kickstart", "-k", &service_target()])?;
+    let out = (launchd.run)(&["kickstart", "-k", &service_target()])?;
     if !out.status.success() {
         bail!(
             "launchctl kickstart failed: {}",
@@ -233,7 +271,11 @@ pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
 /// Stop the running agent. The LaunchAgent stays installed (it will start
 /// again at login); `uninstall` removes it for good.
 pub fn stop() -> Result<()> {
-    let out = launchctl(&["bootout", &service_target()])?;
+    stop_in(&Launchd::real()?)
+}
+
+fn stop_in(launchd: &Launchd<'_>) -> Result<()> {
+    let out = (launchd.run)(&["bootout", &service_target()])?;
     if !out.status.success() {
         bail!("{STOP_NOT_LOADED}");
     }
@@ -243,9 +285,13 @@ pub fn stop() -> Result<()> {
 
 /// Boot the agent out of launchd (best-effort) and remove the plist.
 pub fn uninstall() -> Result<()> {
-    let _ = launchctl(&["bootout", &service_target()]); // may simply not be loaded
-    let plist = plist_path()?;
-    match std::fs::remove_file(&plist) {
+    uninstall_in(&Launchd::real()?)
+}
+
+fn uninstall_in(launchd: &Launchd<'_>) -> Result<()> {
+    let _ = (launchd.run)(&["bootout", &service_target()]); // may simply not be loaded
+    let plist = launchd.plist.as_path();
+    match std::fs::remove_file(plist) {
         Ok(()) => println!(
             "tapwarden stopped and LaunchAgent removed ({}).",
             plist.display()
@@ -263,10 +309,14 @@ const LOG_READ_CAP: u64 = 1024 * 1024; // 1 MiB
 
 /// Print the last `LOG_TAIL_LINES` lines of the agent log.
 pub fn logs() -> Result<()> {
-    let path = log_path()?;
+    logs_in(&Launchd::real()?)
+}
+
+fn logs_in(launchd: &Launchd<'_>) -> Result<()> {
+    let path = launchd.log.as_path();
     // Never print through a swapped-in symlink.
-    crate::runtime_paths::reject_symlink(&path)?;
-    let contents = read_tail(&path, LOG_READ_CAP)?;
+    crate::runtime_paths::reject_symlink(path)?;
+    let contents = read_tail(path, LOG_READ_CAP)?;
     for line in tail(&contents, LOG_TAIL_LINES) {
         println!("{line}");
     }
@@ -384,6 +434,277 @@ mod tests {
         assert_eq!(t.last(), Some(&"60"));
         assert_eq!(tail("a\nb", 50), vec!["a", "b"], "short logs print whole");
         assert!(tail("", 50).is_empty());
+    }
+
+    // ---- Lifecycle against a fake launchctl. Nothing here touches the real
+    // launchd or the real ~/Library paths.
+
+    use std::cell::RefCell;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn output(code: i32, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// Records every launchctl invocation and answers from `replies`, which
+    /// maps the subcommand to its exit code. A subcommand with no entry
+    /// succeeds.
+    struct FakeLaunchctl {
+        calls: RefCell<Vec<String>>,
+        replies: Vec<(&'static str, i32)>,
+    }
+
+    impl FakeLaunchctl {
+        fn new(replies: Vec<(&'static str, i32)>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                replies,
+            }
+        }
+
+        fn respond(&self, args: &[&str]) -> Result<std::process::Output> {
+            let sub = args[0];
+            self.calls.borrow_mut().push(sub.to_string());
+            let code = self
+                .replies
+                .iter()
+                .find(|(name, _)| *name == sub)
+                .map_or(0, |(_, code)| *code);
+            Ok(output(code, "launchctl said no"))
+        }
+
+        fn subcommands(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    fn minimal_config() -> Config {
+        serde_yaml::from_str("secret_ids: [x]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: e\n  credentials: keychain\n").unwrap()
+    }
+
+    /// Builds a `Launchd` over a temp dir so no real plist or log is touched.
+    fn fake_launchd<'a>(
+        dir: &crate::test_support::TmpDir,
+        run: &'a dyn Fn(&[&str]) -> Result<std::process::Output>,
+    ) -> Launchd<'a> {
+        Launchd {
+            plist: dir.join("com.tapwarden.agent.plist"),
+            log: dir.join("tapwarden.log"),
+            run,
+            retry_budget: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn start_writes_a_0644_plist_and_bootstraps_then_kickstarts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+
+        start_in(&launchd, &minimal_config(), None).expect("a cooperative launchctl must succeed");
+
+        let plist = std::fs::read_to_string(&launchd.plist).expect("plist must be written");
+        assert!(plist.contains("<string>com.tapwarden.agent</string>"));
+        assert!(plist.contains(launchd.log.to_str().unwrap()));
+        let mode = std::fs::metadata(&launchd.plist)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+        assert_eq!(
+            fake.subcommands(),
+            vec!["bootout", "bootstrap", "kickstart"]
+        );
+    }
+
+    #[test]
+    fn start_retries_bootstrap_while_launchd_finishes_the_bootout() {
+        // The 0.2.2 bug: bootout returns before launchd has finished removing
+        // the service, so the first bootstrap can still fail with "already
+        // loaded". Only retry when we actually booted something out.
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![]);
+        let attempts = RefCell::new(0);
+        let run = |args: &[&str]| {
+            if args[0] == "bootstrap" {
+                *attempts.borrow_mut() += 1;
+                if *attempts.borrow() < 3 {
+                    fake.calls.borrow_mut().push("bootstrap".to_string());
+                    return Ok(output(5, "Bootstrap failed: 5"));
+                }
+            }
+            if args[0] == "print" {
+                fake.calls.borrow_mut().push("print".to_string());
+                return Ok(output(1, "")); // not loaded yet
+            }
+            fake.respond(args)
+        };
+        let mut launchd = fake_launchd(&dir, &run);
+        // Three attempts at a 50ms interval need more than the give-up budget
+        // the other tests use.
+        launchd.retry_budget = Duration::from_secs(2);
+
+        start_in(&launchd, &minimal_config(), None).expect("the retry must ride out the race");
+        assert_eq!(*attempts.borrow(), 3, "bootstrap must have been retried");
+    }
+
+    #[test]
+    fn start_accepts_a_failed_bootstrap_when_the_service_is_loaded_anyway() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![("bootstrap", 5)]); // print succeeds => loaded
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+
+        start_in(&launchd, &minimal_config(), None)
+            .expect("a service that is loaded is started, whatever bootstrap said");
+    }
+
+    #[test]
+    fn start_fails_when_bootstrap_fails_and_nothing_is_loaded() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        // bootout fails => booted_out is false => no retry, straight to the error.
+        let fake = FakeLaunchctl::new(vec![("bootout", 1), ("bootstrap", 5), ("print", 1)]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+
+        let err = format!(
+            "{:#}",
+            start_in(&launchd, &minimal_config(), None)
+                .expect_err("bootstrap failure must surface")
+        );
+        assert!(err.contains("bootstrap failed"), "{err}");
+        assert!(
+            !fake.subcommands().contains(&"kickstart".to_string()),
+            "kickstart must not run after a failed bootstrap"
+        );
+        assert_eq!(
+            fake.subcommands()
+                .iter()
+                .filter(|s| *s == "bootstrap")
+                .count(),
+            1,
+            "nothing was booted out, so there is no launchd race to wait for"
+        );
+    }
+
+    #[test]
+    fn start_gives_up_once_the_retry_budget_is_spent() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        // We booted something out, so retries are warranted — but bootstrap
+        // never recovers and the service never shows up as loaded.
+        let fake = FakeLaunchctl::new(vec![("bootstrap", 5), ("print", 1)]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+
+        let started = Instant::now();
+        let err = format!(
+            "{:#}",
+            start_in(&launchd, &minimal_config(), None).expect_err("the retry must not be forever")
+        );
+        assert!(err.contains("bootstrap failed"), "{err}");
+        assert!(
+            started.elapsed() >= launchd.retry_budget,
+            "it must actually have waited out the budget"
+        );
+        assert!(
+            fake.subcommands()
+                .iter()
+                .filter(|s| *s == "bootstrap")
+                .count()
+                > 1,
+            "a booted-out service must be retried"
+        );
+    }
+
+    #[test]
+    fn start_fails_when_kickstart_fails() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![("kickstart", 1)]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+
+        let err = format!(
+            "{:#}",
+            start_in(&launchd, &minimal_config(), None)
+                .expect_err("kickstart failure must surface")
+        );
+        assert!(err.contains("kickstart failed"), "{err}");
+    }
+
+    #[test]
+    fn start_refuses_a_pre_planted_plist_symlink() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+        let elsewhere = dir.join("attacker-owned");
+        std::os::unix::fs::symlink(&elsewhere, &launchd.plist).unwrap();
+
+        start_in(&launchd, &minimal_config(), None)
+            .expect_err("launchd must never be pointed through a planted symlink");
+        assert!(
+            !elsewhere.exists(),
+            "nothing may be written through the link"
+        );
+        assert!(
+            fake.subcommands().is_empty(),
+            "launchctl must not be reached"
+        );
+    }
+
+    #[test]
+    fn stop_reports_the_not_loaded_case_without_process_output() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![]);
+        let run = |args: &[&str]| fake.respond(args);
+        stop_in(&fake_launchd(&dir, &run)).expect("a loaded service stops");
+
+        let fake = FakeLaunchctl::new(vec![("bootout", 1)]);
+        let run = |args: &[&str]| fake.respond(args);
+        let err = format!(
+            "{:#}",
+            stop_in(&fake_launchd(&dir, &run)).expect_err("nothing to stop is an error")
+        );
+        assert_eq!(err, STOP_NOT_LOADED);
+        assert!(
+            !err.contains("launchctl said no"),
+            "launchctl output must never reach the user: {err}"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_the_plist_and_tolerates_a_missing_one() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![("bootout", 1)]); // not loaded: still fine
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+
+        std::fs::write(&launchd.plist, "plist").unwrap();
+        uninstall_in(&launchd).expect("an installed agent uninstalls");
+        assert!(!launchd.plist.exists());
+
+        uninstall_in(&launchd).expect("uninstalling twice must not be an error");
+    }
+
+    #[test]
+    fn logs_prints_from_the_configured_log_path() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+
+        std::fs::write(&launchd.log, "line one\nline two\n").unwrap();
+        logs_in(&launchd).expect("an existing log prints");
+
+        std::fs::remove_file(&launchd.log).unwrap();
+        logs_in(&launchd).expect_err("a missing log is an error");
     }
 
     #[test]

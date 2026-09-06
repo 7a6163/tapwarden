@@ -71,8 +71,14 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    run(Cli::parse().command).await
+}
+
+/// Dispatch one parsed subcommand. Split out of `main` so the arms that only
+/// resolve and validate — `start`, `doctor`, `socket-path` — can be driven
+/// from tests without launchd, a terminal, or a security key.
+async fn run(command: Commands) -> Result<()> {
+    match command {
         Commands::Start { fg, config } => {
             // Load the config in both paths: an invalid config must fail here,
             // not crash-loop inside a freshly installed LaunchAgent.
@@ -158,5 +164,48 @@ mod tests {
     #[test]
     fn an_unknown_subcommand_is_rejected() {
         assert!(Cli::try_parse_from(["tapwarden", "definitely-not-a-command"]).is_err());
+    }
+
+    /// The arms that only resolve and validate. Deliberately not covered:
+    /// `stop`/`logs`/`uninstall` would drive the real launchd and the real log,
+    /// `setup`/`store-token` read the terminal, and `register-yubikey` needs a
+    /// security key.
+    #[tokio::test]
+    async fn socket_path_prints_without_touching_anything() {
+        run(Commands::SocketPath)
+            .await
+            .expect("printing the socket path must not need a running agent");
+    }
+
+    #[tokio::test]
+    async fn start_rejects_a_bad_config_before_installing_a_launchagent() {
+        // The whole point of loading the config in `start`: a broken config
+        // must fail here, not crash-loop inside a freshly installed agent.
+        for fg in [true, false] {
+            let err = run(Commands::Start {
+                fg,
+                config: Some("/nonexistent/tapwarden.yaml".into()),
+            })
+            .await
+            .expect_err("a missing config must stop start in its tracks");
+            assert!(err.to_string().contains("configuration"), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_runs_the_local_checks_from_a_parsed_command() {
+        let dir = crate::test_support::TmpDir::new("cli");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "secret_ids: [00000000-0000-0000-0000-000000000000]\n",
+        )
+        .unwrap();
+        run(Commands::Doctor {
+            config: Some(path.to_str().unwrap().to_string()),
+            check_backend: false,
+        })
+        .await
+        .expect("local diagnostics must pass against a valid config");
     }
 }
