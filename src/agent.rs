@@ -151,7 +151,6 @@ impl KeyService {
         let ctx = AuthContext::Sign {
             key_comment: &comment,
             key_fingerprint: &fingerprint,
-            data_len: request.data.len(),
         };
         let approved = self
             .authorizer

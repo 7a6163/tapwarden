@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `tapwarden logs` no longer fails on a log that is not valid UTF-8. The read
+  of the last 1 MiB lands at an arbitrary byte offset, so on a large log the
+  seek almost always splits a character; the whole log is now decoded lossily
+  instead of being rejected.
+
+### Security
+
+- BWS `server_endpoint` given as a full URL now rejects embedded credentials
+  (`https://user:pass@host`), matching the bare-host form. They would have been
+  sent as a Basic-auth header on every request.
+
 ## [0.2.2] - 2026-07-23
 
 ### Fixed
