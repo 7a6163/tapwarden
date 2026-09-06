@@ -10,6 +10,8 @@ mod keychain;
 mod runtime_paths;
 mod secret_source;
 mod setup;
+#[cfg(test)]
+mod test_support;
 mod vaultwarden;
 
 use config::Config;
@@ -104,4 +106,57 @@ async fn main() -> Result<()> {
         Commands::SocketPath => println!("{}", runtime_paths::socket_path()?.display()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn subcommands_and_their_flags_parse() {
+        assert!(matches!(
+            Cli::parse_from(["tapwarden", "start", "--fg", "--config", "/tmp/c.yaml"]).command,
+            Commands::Start { fg: true, config: Some(path) } if path == "/tmp/c.yaml"
+        ));
+        assert!(matches!(
+            Cli::parse_from(["tapwarden", "doctor", "--check-backend"]).command,
+            Commands::Doctor {
+                check_backend: true,
+                ..
+            }
+        ));
+        for (args, expected) in [
+            (["tapwarden", "stop"], "Stop"),
+            (["tapwarden", "logs"], "Logs"),
+            (["tapwarden", "uninstall"], "Uninstall"),
+            (["tapwarden", "socket-path"], "SocketPath"),
+            (["tapwarden", "setup"], "Setup"),
+            (["tapwarden", "store-token"], "StoreToken"),
+            (["tapwarden", "register-yubikey"], "RegisterYubikey"),
+        ] {
+            let parsed = Cli::parse_from(args).command;
+            let name = match parsed {
+                Commands::Stop => "Stop",
+                Commands::Logs => "Logs",
+                Commands::Uninstall => "Uninstall",
+                Commands::SocketPath => "SocketPath",
+                Commands::Setup => "Setup",
+                Commands::StoreToken => "StoreToken",
+                Commands::RegisterYubikey => "RegisterYubikey",
+                _ => "other",
+            };
+            assert_eq!(name, expected, "for {args:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_subcommand_is_rejected() {
+        assert!(Cli::try_parse_from(["tapwarden", "definitely-not-a-command"]).is_err());
+    }
 }

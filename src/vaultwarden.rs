@@ -836,6 +836,165 @@ mod tests {
         }
     }
 
+    // ---- Protocol paths against a loopback stub (no network leaves the box).
+
+    const STUB_EMAIL: &str = "tapwarden@example.com";
+    const STUB_PASSWORD: &str = "asdfasdf";
+    const STUB_ITERATIONS: u32 = 100_000;
+
+    /// Stub routes for a personal-API-key login that yields `user_key()`, plus
+    /// one type-5 cipher holding `private_key` under that key.
+    fn vw_stub_routes(id: Uuid, name: &str, private_key: &str) -> Vec<(String, u16, String)> {
+        let master_key = derive_master_key(
+            STUB_PASSWORD,
+            STUB_EMAIL,
+            &KdfParams {
+                kdf: KDF_PBKDF2,
+                iterations: STUB_ITERATIONS,
+                memory: None,
+                parallelism: None,
+            },
+        )
+        .unwrap();
+        let user = user_key();
+        let mut user_bytes = user.enc.to_vec();
+        user_bytes.extend_from_slice(&user.mac);
+        vec![
+            (
+                "/identity/connect/token".to_string(),
+                200,
+                json!({
+                    "access_token": "stub-bearer",
+                    "Key": make_enc_string(&user_bytes, &stretch_master_key(&master_key), [0x07; 16]),
+                    "Kdf": KDF_PBKDF2,
+                    "KdfIterations": STUB_ITERATIONS,
+                })
+                .to_string(),
+            ),
+            (
+                format!("/api/ciphers/{id}"),
+                200,
+                json!({
+                    "type": CIPHER_TYPE_SSH_KEY,
+                    "organizationId": null,
+                    "key": null,
+                    "name": make_enc_string(name.as_bytes(), &user, [0x08; 16]),
+                    "sshKey": {
+                        "privateKey": make_enc_string(private_key.as_bytes(), &user, [0x09; 16])
+                    },
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    fn stub_fetcher(base_url: &str, master_password: &str) -> VaultwardenFetcher {
+        VaultwardenFetcher::new(
+            base_url,
+            STUB_EMAIL,
+            VwCredentials::Env {
+                client_id: "user.00000000-0000-0000-0000-000000000000".to_string(),
+                client_secret: "stub-secret".to_string(),
+                master_password: master_password.to_string(),
+            },
+            Arc::new(crate::authorizer::AlwaysAllow),
+        )
+        .expect("loopback http server_url is accepted")
+    }
+
+    /// `SecretData` has no `Debug` on purpose, so errors cannot go through
+    /// `expect_err`.
+    fn err_of(result: Result<SecretData>) -> String {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_in_and_decrypts_an_ssh_key_cipher() {
+        let id = Uuid::from_u128(9);
+        let server = crate::test_support::StubServer::start(vw_stub_routes(
+            id,
+            "deploy-key",
+            "PRIVATE-KEY-MATERIAL",
+        ))
+        .await;
+        let fetcher = stub_fetcher(&server.base_url, STUB_PASSWORD);
+
+        let secret = fetcher.get(id).await.expect("stub cipher must decrypt");
+        assert_eq!(secret.name, "deploy-key");
+        assert_eq!(secret.openssh_private_key, "PRIVATE-KEY-MATERIAL");
+
+        // The session is cached: a second fetch must not re-authenticate.
+        assert_eq!(fetcher.get(id).await.unwrap().name, "deploy-key");
+    }
+
+    #[tokio::test]
+    async fn wrong_master_password_fails_user_key_decryption() {
+        let id = Uuid::from_u128(9);
+        let server = crate::test_support::StubServer::start(vw_stub_routes(id, "n", "k")).await;
+        let err = err_of(
+            stub_fetcher(&server.base_url, "wrong-password")
+                .get(id)
+                .await,
+        );
+        assert!(err.contains("user key decryption"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn token_exchange_failure_reports_status_without_a_body() {
+        let server = crate::test_support::StubServer::start(vec![(
+            "/identity/connect/token".to_string(),
+            400,
+            r#"{"error":"invalid_client","hint":"SUPERSECRETVALUE"}"#.to_string(),
+        )])
+        .await;
+        let err = err_of(
+            stub_fetcher(&server.base_url, STUB_PASSWORD)
+                .get(Uuid::from_u128(9))
+                .await,
+        );
+        assert!(err.contains("400"), "{err}");
+        assert!(
+            !err.contains("SUPERSECRETVALUE"),
+            "error echoed the body: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cipher_fetch_failure_reports_status_without_a_body() {
+        let id = Uuid::from_u128(9);
+        let mut routes = vw_stub_routes(id, "n", "k");
+        routes.pop(); // keep the login; the cipher itself 404s
+        let server = crate::test_support::StubServer::start(routes).await;
+        let err = err_of(stub_fetcher(&server.base_url, STUB_PASSWORD).get(id).await);
+        assert!(err.contains("404"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn server_reported_kdf_outside_the_bounds_is_refused() {
+        let server = crate::test_support::StubServer::start(vec![(
+            "/identity/connect/token".to_string(),
+            200,
+            json!({
+                "access_token": "stub-bearer",
+                "Key": "2.AAAA|AAAA|AAAA",
+                "Kdf": KDF_PBKDF2,
+                // A downgrade would make the master password brute-forceable.
+                "KdfIterations": 1,
+            })
+            .to_string(),
+        )])
+        .await;
+        let err = err_of(
+            stub_fetcher(&server.base_url, STUB_PASSWORD)
+                .get(Uuid::from_u128(9))
+                .await,
+        );
+        assert!(err.contains("master key derivation"), "{err}");
+    }
+
     /// Real-Vaultwarden integration test. Run explicitly with:
     /// `TAPWARDEN_VW_SERVER=... TAPWARDEN_VW_EMAIL=... TAPWARDEN_VW_CLIENT_ID=...
     ///  TAPWARDEN_VW_CLIENT_SECRET=... TAPWARDEN_VW_MASTER_PASSWORD=...

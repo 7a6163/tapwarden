@@ -489,14 +489,57 @@ impl SecretFetcher for BwsRest {
     }
 }
 
+/// Public test fixture from the official SDK's access_token.rs tests — not a
+/// real credential.
+#[cfg(test)]
+pub(crate) const SDK_TEST_TOKEN: &str = "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.C2IgxjjLF7qSshsbwe8JGcbM075YXw:X8vbvA0bduihIDe/qrzIQQ==";
+
+/// Test fixture: the stub-server routes that let a `BwsRest` built from
+/// `SDK_TEST_TOKEN` complete the token exchange and resolve `id` to
+/// `(name, private_key)`. Shared with the `doctor --check-backend` tests.
+#[cfg(test)]
+pub(crate) fn bws_stub_routes(
+    id: Uuid,
+    name: &str,
+    private_key: &str,
+) -> Vec<(String, u16, String)> {
+    use base64::engine::general_purpose::STANDARD as B64_PAD;
+
+    let token_key = AccessToken::parse(SDK_TEST_TOKEN)
+        .expect("fixture token parses")
+        .encryption_key;
+    let org_key = SymKey {
+        enc: [0x33; 32],
+        mac: [0x44; 32],
+    };
+    let mut org_bytes = org_key.enc.to_vec();
+    org_bytes.extend_from_slice(&org_key.mac);
+    let payload = format!(r#"{{"encryptionKey":"{}"}}"#, B64_PAD.encode(&org_bytes));
+    vec![
+        (
+            "/identity/connect/token".to_string(),
+            200,
+            format!(
+                r#"{{"access_token":"stub-bearer","encrypted_payload":"{}"}}"#,
+                make_enc_string(payload.as_bytes(), &token_key, [0x01; 16])
+            ),
+        ),
+        (
+            format!("/api/secrets/{id}"),
+            200,
+            format!(
+                r#"{{"key":"{}","value":"{}"}}"#,
+                make_enc_string(name.as_bytes(), &org_key, [0x02; 16]),
+                make_enc_string(private_key.as_bytes(), &org_key, [0x03; 16])
+            ),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64_PAD;
-
-    // Public test fixture from the official SDK's access_token.rs tests —
-    // not a real credential.
-    const SDK_TEST_TOKEN: &str = "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.C2IgxjjLF7qSshsbwe8JGcbM075YXw:X8vbvA0bduihIDe/qrzIQQ==";
 
     #[test]
     fn parses_access_token_and_derives_sdk_known_key() {
@@ -657,5 +700,124 @@ mod tests {
         let secret = fetcher.get(id).await.unwrap();
         assert!(!secret.name.is_empty());
         assert!(!secret.openssh_private_key.is_empty());
+    }
+
+    // ---- Protocol paths against a loopback stub (no network leaves the box).
+
+    /// Denies every request; `Grace` never covers credential unlocks, so this
+    /// is what a user pressing Cancel on the keychain prompt looks like.
+    struct DenyAll;
+
+    #[async_trait]
+    impl Authorizer for DenyAll {
+        async fn approve(&self, _ctx: &AuthContext<'_>) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// `SecretData` has no `Debug` on purpose (it holds a private key), so
+    /// error assertions cannot go through `expect_err`.
+    fn err_of(result: Result<SecretData>) -> String {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    fn stub_fetcher(base_url: &str) -> BwsRest {
+        BwsRest::new(
+            BwsCredentials::Env(SDK_TEST_TOKEN.to_string()),
+            Some(base_url),
+            Arc::new(crate::authorizer::AlwaysAllow),
+        )
+        .expect("loopback http endpoint is accepted")
+    }
+
+    #[tokio::test]
+    async fn authenticates_and_decrypts_a_fetched_secret() {
+        let id = Uuid::from_u128(7);
+        let server = crate::test_support::StubServer::start(bws_stub_routes(
+            id,
+            "deploy-key",
+            "PRIVATE-KEY-MATERIAL",
+        ))
+        .await;
+        let fetcher = stub_fetcher(&server.base_url);
+
+        let secret = fetcher.get(id).await.expect("stub secret must decrypt");
+        assert_eq!(secret.name, "deploy-key");
+        assert_eq!(secret.openssh_private_key, "PRIVATE-KEY-MATERIAL");
+
+        // The session is cached: a second fetch must not re-authenticate.
+        assert_eq!(fetcher.get(id).await.unwrap().name, "deploy-key");
+    }
+
+    #[tokio::test]
+    async fn token_exchange_failure_reports_status_without_a_body() {
+        let server = crate::test_support::StubServer::start(vec![(
+            "/identity/connect/token".to_string(),
+            401,
+            r#"{"error":"invalid_client","hint":"SUPERSECRETVALUE"}"#.to_string(),
+        )])
+        .await;
+        let err = err_of(stub_fetcher(&server.base_url).get(Uuid::from_u128(7)).await);
+        assert!(err.contains("401"), "{err}");
+        assert!(
+            !err.contains("SUPERSECRETVALUE"),
+            "error echoed the body: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_fetch_failure_reports_status_without_a_body() {
+        let id = Uuid::from_u128(7);
+        let mut routes = bws_stub_routes(id, "n", "k");
+        routes.pop(); // leave only the token exchange; the secret 404s
+        let server = crate::test_support::StubServer::start(routes).await;
+        let err = err_of(stub_fetcher(&server.base_url).get(id).await);
+        assert!(err.contains("404"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn keychain_token_is_never_read_when_the_gate_denies() {
+        let server = crate::test_support::StubServer::start(vec![]).await;
+        let fetcher = BwsRest::new(
+            BwsCredentials::Keychain,
+            Some(&server.base_url),
+            Arc::new(DenyAll),
+        )
+        .unwrap();
+        let err = err_of(fetcher.get(Uuid::from_u128(7)).await);
+        assert!(err.contains("denied"), "{err}");
+        assert!(
+            err.contains("keychain was not read"),
+            "the denial must happen before any keychain read: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_response_bodies_are_refused() {
+        let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(MAX_RESPONSE_BYTES));
+        let server =
+            crate::test_support::StubServer::start(vec![("/big".to_string(), 200, big)]).await;
+        let response = http_client()
+            .unwrap()
+            .get(format!("{}/big", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        let err = format!(
+            "{:#}",
+            json_capped::<serde_json::Value>(response)
+                .await
+                .expect_err("a body over the cap must be refused")
+        );
+        assert!(err.contains("size limit"), "{err}");
+    }
+
+    #[test]
+    fn store_token_validation_accepts_only_well_formed_tokens() {
+        assert!(validate_access_token(SDK_TEST_TOKEN).is_ok());
+        assert!(validate_access_token("nonsense").is_err());
     }
 }

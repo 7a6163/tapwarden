@@ -67,4 +67,33 @@ mod tests {
         assert_eq!(meta.uid(), uid());
         assert_eq!(meta.mode() & 0o777, 0o700);
     }
+
+    #[test]
+    fn socket_lives_in_the_private_runtime_dir() {
+        let socket = socket_path().expect("socket_path should succeed");
+        assert!(socket.ends_with("agent.sock"));
+        assert_eq!(socket.parent(), Some(runtime_dir().unwrap().as_path()));
+    }
+
+    #[test]
+    fn symlinks_and_non_regular_files_are_refused() {
+        let dir = crate::test_support::TmpDir::new("paths");
+
+        let missing = dir.join("not-there");
+        reject_symlink(&missing).expect("a path we are about to create is fine");
+
+        let regular = dir.join("regular");
+        std::fs::write(&regular, b"x").unwrap();
+        reject_symlink(&regular).expect("a regular file is fine");
+
+        let planted = dir.join("planted");
+        std::os::unix::fs::symlink(&regular, &planted).unwrap();
+        let err = format!(
+            "{:#}",
+            reject_symlink(&planted).expect_err("a symlink must be refused")
+        );
+        assert!(err.contains("regular file"), "{err}");
+
+        reject_symlink(&dir.0).expect_err("a directory is not a regular file either");
+    }
 }

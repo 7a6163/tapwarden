@@ -1,0 +1,11 @@
+# Test fixtures that must reach the process as real environment variables:
+# `Config` resolves credentials from env vars by name, and writing them from a
+# test thread races every concurrent `getenv` (reqwest reads the proxy vars) —
+# on macOS that aborts the test binary. Cargo sets these before the process
+# starts, so nothing races. None of them is a credential: the BWS token is the
+# published fixture from the official SDK's own tests.
+[env]
+TAPWARDEN_TEST_BWS_TOKEN = "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.C2IgxjjLF7qSshsbwe8JGcbM075YXw:X8vbvA0bduihIDe/qrzIQQ=="
+TAPWARDEN_TEST_BWS_BAD_TOKEN = "not-an-access-token"
+TAPWARDEN_TEST_VW_CLIENT_ID = "user.00000000-0000-0000-0000-000000000000"
+TAPWARDEN_TEST_VW_VALUE = "stub-value"

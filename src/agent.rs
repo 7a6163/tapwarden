@@ -334,15 +334,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Throwaway key generated for these tests only — never used anywhere real.
-    const TEST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACCchMvXfB6t0MgCDWTEX3BFd3ryJu7qUK+i+YOxqMDgkQAAAJgrZITGK2SE
-xgAAAAtzc2gtZWQyNTUxOQAAACCchMvXfB6t0MgCDWTEX3BFd3ryJu7qUK+i+YOxqMDgkQ
-AAAEAm+GqINSVahnMAQlWg2nq5Hv32qMRXAMb2+tLQm/aQvZyEy9d8Hq3QyAINZMRfcEV3
-evIm7upQr6L5g7GowOCRAAAAE3VuaXQtdGVzdEB0YXB3YXJkZW4BAg==
------END OPENSSH PRIVATE KEY-----
-";
+    use crate::test_support::TEST_ED25519_KEY as TEST_KEY;
 
     struct FakeFetcher(HashMap<Uuid, String>);
 
@@ -530,5 +522,113 @@ authorization:
             .expect_err("unknown key must fail");
         assert!(matches!(err, AgentError::Failure));
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no key match → no prompt");
+    }
+
+    // ---- Wiring: config -> concrete fetcher / authorizer.
+
+    fn parse_config(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("test config parses")
+    }
+
+    const KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+    #[test]
+    fn every_backend_and_credential_source_builds_a_fetcher() {
+        // Both are set by .cargo/config.toml: writing them here would race
+        // every concurrent getenv in the suite.
+        let token = "TAPWARDEN_TEST_BWS_TOKEN";
+        let vw = "TAPWARDEN_TEST_VW_CLIENT_ID";
+
+        for yaml in [
+            format!("secret_ids: [{KEY_ID}]\naccess_token_env: {token}\n"),
+            format!("secret_ids: [{KEY_ID}]\ncredentials: keychain\n"),
+            format!(
+                "secret_ids: [{KEY_ID}]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: t@example.com\n  client_id_env: {vw}\n  client_secret_env: {vw}\n  master_password_env: {vw}\n"
+            ),
+            format!(
+                "secret_ids: [{KEY_ID}]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: t@example.com\n  credentials: keychain\n"
+            ),
+        ] {
+            let config = parse_config(&yaml);
+            build_fetcher(&config, Arc::new(crate::authorizer::AlwaysAllow))
+                .unwrap_or_else(|e| panic!("must build a fetcher for:\n{yaml}\n{e:#}"));
+        }
+    }
+
+    #[test]
+    fn a_vaultwarden_config_without_its_section_fails_to_build() {
+        let config = parse_config(&format!("secret_ids: [{KEY_ID}]\nbackend: vaultwarden\n"));
+        let err = build_fetcher(&config, Arc::new(crate::authorizer::AlwaysAllow))
+            .err()
+            .expect("no vaultwarden section means no fetcher");
+        assert!(err.to_string().contains("vaultwarden"), "{err:#}");
+    }
+
+    #[test]
+    fn a_malformed_bws_token_fails_before_the_agent_starts() {
+        let token = "TAPWARDEN_TEST_BWS_BAD_TOKEN"; // set by .cargo/config.toml
+        let config = parse_config(&format!(
+            "secret_ids: [{KEY_ID}]\naccess_token_env: {token}\n"
+        ));
+        assert!(
+            build_fetcher(&config, Arc::new(crate::authorizer::AlwaysAllow)).is_err(),
+            "a typo'd access token must fail at construction, not at first signature"
+        );
+    }
+
+    #[test]
+    fn authorization_mode_and_factor_select_the_authorizer() {
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, {
+            let mut k = [0u8; 65];
+            k[0] = 0x04;
+            k
+        });
+        for yaml in [
+            format!("secret_ids: [{KEY_ID}]\n"),
+            format!("secret_ids: [{KEY_ID}]\nauthorization:\n  mode: grace\n  grace_seconds: 5\n"),
+            format!(
+                "secret_ids: [{KEY_ID}]\nauthorization:\n  mode: grace\n  factor: yubikey\n  yubikey:\n    credential_id: AA==\n    public_key:\n      algorithm: es256\n      bytes: {key}\n"
+            ),
+        ] {
+            let config = parse_config(&yaml);
+            build_authorizer(&config)
+                .unwrap_or_else(|e| panic!("must build an authorizer for:\n{yaml}\n{e:#}"));
+        }
+    }
+
+    #[test]
+    fn yubikey_factor_without_a_registered_credential_fails_closed() {
+        let config = parse_config(&format!(
+            "secret_ids: [{KEY_ID}]\nauthorization:\n  factor: yubikey\n"
+        ));
+        let err = build_authorizer(&config)
+            .err()
+            .expect("no credential means no authorizer");
+        assert!(err.to_string().contains("register-yubikey"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_key_with_no_comment_falls_back_to_the_secret_name() {
+        let mut key = PrivateKey::from_openssh(TEST_KEY).unwrap();
+        key.set_comment("");
+        let id = Uuid::from_u128(5);
+        let fetcher = FakeFetcher(HashMap::from([(
+            id,
+            key.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string(),
+        )]));
+        let loaded = load_key(&fetcher, id)
+            .await
+            .expect("comment-less key loads");
+        assert_eq!(loaded.comment, format!("secret-{id}"));
+        assert!(!loaded.fingerprint.is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_keys_rejects_a_secret_id_that_is_not_a_uuid() {
+        let config = parse_config("secret_ids: [not-a-uuid]\n");
+        let err = probe_keys(&config)
+            .await
+            .expect_err("a malformed id must fail the probe");
+        assert!(err.to_string().contains("not a UUID"), "{err:#}");
     }
 }

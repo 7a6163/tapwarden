@@ -394,6 +394,36 @@ mod tests {
     }
 
     #[test]
+    fn launchd_targets_are_scoped_to_the_gui_session_of_this_uid() {
+        let uid = runtime_paths::uid();
+        assert_eq!(label(), LABEL);
+        assert_eq!(gui_domain(), format!("gui/{uid}"));
+        assert_eq!(service_target(), format!("gui/{uid}/{LABEL}"));
+    }
+
+    #[test]
+    fn is_loaded_answers_without_mutating_launchd() {
+        // Read-only probe: whichever way it answers, it must not panic and the
+        // plist must still be exactly as it was.
+        let before = plist_path().unwrap().exists();
+        let _ = is_loaded();
+        assert_eq!(plist_path().unwrap().exists(), before);
+    }
+
+    #[test]
+    fn launchctl_surfaces_a_usable_output_for_an_unknown_subcommand() {
+        let out = launchctl(&[
+            "print",
+            "gui/4294967294/com.tapwarden.definitely-not-loaded",
+        ])
+        .expect("launchctl must be runnable");
+        assert!(
+            !out.status.success(),
+            "an unloaded target must exit non-zero"
+        );
+    }
+
+    #[test]
     #[ignore = "manual: talks to the real launchctl"]
     fn launchctl_supports_modern_subcommands_manual() {
         for sub in ["bootstrap", "bootout", "kickstart"] {

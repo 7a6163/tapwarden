@@ -550,4 +550,46 @@ mod tests {
         println!("Biometric::approve returned: {result:?}");
         result.expect("platform error raising the Touch ID / LocalAuthentication prompt");
     }
+
+    #[test]
+    fn assertion_credential_id_must_match_or_be_omitted() {
+        let registered = b"registered-credential";
+        assert!(yubikey_credential_matches(registered, registered));
+        // CTAP may omit the descriptor when the allow-list has one entry.
+        assert!(yubikey_credential_matches(registered, b""));
+        assert!(
+            !yubikey_credential_matches(registered, b"some-other-credential"),
+            "an assertion from a different credential must never be accepted"
+        );
+    }
+
+    #[test]
+    fn assertion_without_user_presence_is_rejected() {
+        use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion;
+        let key = ctap_hid_fido2::public_key::PublicKey::with_der(
+            &[0x04; 65],
+            ctap_hid_fido2::public_key::PublicKeyType::Ecdsa256,
+        );
+        let mut assertion = Assertion {
+            credential_id: b"registered".to_vec(),
+            ..Default::default()
+        };
+        assert!(
+            !assertion.flags.user_present_result,
+            "an assertion starts without the presence bit"
+        );
+        assert!(
+            !yubikey_assertion_is_valid(b"registered", &key, b"challenge", &assertion),
+            "no physical touch means no approval"
+        );
+
+        // Even with presence set, an unsigned assertion must not verify.
+        assertion.flags.user_present_result = true;
+        assert!(!yubikey_assertion_is_valid(
+            b"registered",
+            &key,
+            b"challenge",
+            &assertion
+        ));
+    }
 }

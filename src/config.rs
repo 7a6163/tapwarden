@@ -383,30 +383,50 @@ mod tests {
         );
     }
 
+    /// The env var carrying a non-UTF-8 value for the test below.
+    const NON_UNICODE_VAR: &str = "TAPWARDEN_TEST_NON_UNICODE_SECRET";
+
+    /// Writing an env var from a test thread races every concurrent `getenv`
+    /// in the suite (reqwest reads the proxy vars), which aborts the process
+    /// on macOS — and a non-UTF-8 value cannot be pre-set by cargo's `[env]`.
+    /// So set it for a child process and let the assertion run there.
     #[test]
     fn non_unicode_env_value_never_leaks_into_the_error() {
         use std::os::unix::ffi::OsStrExt;
-        let name = "TAPWARDEN_TEST_NON_UNICODE_SECRET";
-        // Invalid UTF-8 wrapped around a recognizable marker.
-        // SAFETY: test-only, single-threaded `cargo test` process; no other
-        // thread reads/writes the environment concurrently with this call.
-        unsafe {
-            std::env::set_var(
-                name,
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::non_unicode_env_value_is_reported_without_its_value",
+                "--ignored",
+                "--nocapture",
+            ])
+            // Invalid UTF-8 wrapped around a recognizable marker.
+            .env(
+                NON_UNICODE_VAR,
                 std::ffi::OsStr::from_bytes(b"\xffSUPERSECRETVALUE\xfe"),
-            );
-        }
-        let err = env_var(name).expect_err("non-unicode value must be an error");
-        // SAFETY: same as above.
-        unsafe {
-            std::env::remove_var(name);
-        }
+            )
+            .output()
+            .expect("re-running this test binary must work");
+        assert!(
+            output.status.success(),
+            "child assertion failed:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[ignore = "child process of non_unicode_env_value_never_leaks_into_the_error"]
+    fn non_unicode_env_value_is_reported_without_its_value() {
+        let err = env_var(NON_UNICODE_VAR).expect_err("non-unicode value must be an error");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("SUPERSECRETVALUE"),
             "error leaked the env value: {msg}"
         );
-        assert!(msg.contains(name), "error must still name the var: {msg}");
+        assert!(
+            msg.contains(NON_UNICODE_VAR),
+            "error must still name the var: {msg}"
+        );
     }
 
     #[test]
@@ -479,5 +499,89 @@ mod tests {
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         cfg.validate()
             .expect_err("empty BWS endpoint must fail config validation");
+    }
+
+    #[test]
+    fn loads_and_validates_a_config_file_from_an_explicit_path() {
+        let dir = crate::test_support::TmpDir::new("config");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            format!("{MINIMAL_YAML}server_endpoint: bitwarden.eu\n"),
+        )
+        .unwrap();
+        let cfg = Config::load(path.to_str()).expect("a valid config file must load");
+        assert_eq!(cfg.server_endpoint.as_deref(), Some("bitwarden.eu"));
+        assert_eq!(cfg.access_token_env, "BWS_ACCESS_TOKEN");
+    }
+
+    #[test]
+    fn malformed_yaml_names_the_file_it_could_not_parse() {
+        let dir = crate::test_support::TmpDir::new("config");
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "secret_ids: [oops\n").unwrap();
+        let err = format!(
+            "{:#}",
+            Config::load(path.to_str()).expect_err("malformed YAML must fail")
+        );
+        assert!(err.contains("config.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_config_file_with_no_secret_ids_is_rejected() {
+        let dir = crate::test_support::TmpDir::new("config");
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "secret_ids: []\n").unwrap();
+        let err = format!(
+            "{:#}",
+            Config::load(path.to_str()).expect_err("an empty key list is useless")
+        );
+        assert!(err.contains("secret_ids"), "{err}");
+    }
+
+    #[test]
+    fn resolved_path_honours_the_override_and_falls_back_to_the_default() {
+        assert_eq!(
+            resolved_path(Some("/tmp/x.yaml")).unwrap(),
+            PathBuf::from("/tmp/x.yaml")
+        );
+        assert!(resolved_path(None).unwrap().ends_with(CONFIG_REL));
+    }
+
+    #[test]
+    fn credential_accessors_read_the_configured_env_vars() {
+        let name = "TAPWARDEN_TEST_VW_VALUE"; // set by .cargo/config.toml
+        let cfg: Config =
+            serde_yaml::from_str(&format!("{MINIMAL_YAML}access_token_env: {name}\n")).unwrap();
+        assert_eq!(cfg.access_token().unwrap(), "stub-value");
+
+        let vw = VaultwardenConfig {
+            server_url: "https://vault.example.com".into(),
+            email: "t@example.com".into(),
+            credentials: CredentialSource::default(),
+            client_id_env: name.into(),
+            client_secret_env: name.into(),
+            master_password_env: name.into(),
+        };
+        assert_eq!(vw.client_id().unwrap(), "stub-value");
+        assert_eq!(vw.client_secret().unwrap(), "stub-value");
+        assert_eq!(vw.master_password().unwrap(), "stub-value");
+    }
+
+    #[test]
+    fn empty_or_wrong_length_yubikey_material_is_rejected() {
+        for (credential_id, algorithm, key) in [
+            // empty credential id: base64-valid but useless as a handle
+            ("", "es256", STANDARD.encode([0x04; 65])),
+            // ed25519 verifier keys are exactly 32 bytes
+            ("AA==", "ed25519", STANDARD.encode([0u8; 31])),
+        ] {
+            let yaml = format!(
+                "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: {credential_id}\n    public_key:\n      algorithm: {algorithm}\n      bytes: {key}\n"
+            );
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            cfg.validate()
+                .expect_err("malformed verifier material must fail config validation");
+        }
     }
 }

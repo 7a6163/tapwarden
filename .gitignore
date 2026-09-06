@@ -1,3 +1,6 @@
 /target
 /lcov.info
 AGENTS.md
+mutants.out/
+mutants.out.old/
+CLAUDE.md
