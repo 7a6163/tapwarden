@@ -15,9 +15,6 @@ pub enum AuthContext<'a> {
         key_comment: &'a str,
         /// Stable SHA-256 public-key fingerprint used to scope grace windows.
         key_fingerprint: &'a str,
-        /// Length of the data being signed; not shown in the prompt yet.
-        #[allow(dead_code)]
-        data_len: usize,
     },
     /// Reading stored backend credentials (e.g. from the macOS Keychain).
     UnlockCredentials { reason: &'a str },
@@ -362,7 +359,6 @@ mod tests {
         AuthContext::Sign {
             key_comment: "test@key",
             key_fingerprint: "SHA256:key-a",
-            data_len: 32,
         }
     }
 
@@ -457,7 +453,6 @@ mod tests {
         let other = AuthContext::Sign {
             key_comment: "test@key",
             key_fingerprint: "SHA256:key-b",
-            data_len: 32,
         };
         assert!(grace.approve(&other).await.unwrap());
         assert_eq!(
@@ -544,7 +539,6 @@ mod tests {
             .approve(&AuthContext::Sign {
                 key_comment: "m0-poc@tapwarden",
                 key_fingerprint: "SHA256:m0-poc",
-                data_len: 0,
             })
             .await;
         println!("Biometric::approve returned: {result:?}");

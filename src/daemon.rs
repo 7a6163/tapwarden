@@ -263,12 +263,28 @@ const LOG_READ_CAP: u64 = 1024 * 1024; // 1 MiB
 
 /// Print the last `LOG_TAIL_LINES` lines of the agent log.
 pub fn logs() -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
     let path = log_path()?;
-    // Never print through a swapped-in symlink, and never slurp an unbounded
-    // file — read at most the last LOG_READ_CAP bytes.
+    // Never print through a swapped-in symlink.
     crate::runtime_paths::reject_symlink(&path)?;
-    let mut file = std::fs::File::open(&path).with_context(|| {
+    let contents = read_tail(&path, LOG_READ_CAP)?;
+    for line in tail(&contents, LOG_TAIL_LINES) {
+        println!("{line}");
+    }
+    println!();
+    println!("Follow live: tail -f {}", path.display());
+    Ok(())
+}
+
+/// Read at most the last `cap` bytes of `path`, decoding lossily.
+///
+/// The log is whatever the agent wrote to stdout/stderr, so it is not
+/// guaranteed to be valid UTF-8 — and the seek to the last `cap` bytes lands
+/// at an arbitrary byte offset, very likely mid-character on a large file.
+/// `read_to_string` would reject the whole file for either, which would cost
+/// the user their entire log at exactly the moment they are debugging.
+fn read_tail(path: &std::path::Path, cap: u64) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).with_context(|| {
         format!(
             "no log file at {} — has the agent been started with `tapwarden start`?",
             path.display()
@@ -278,19 +294,12 @@ pub fn logs() -> Result<()> {
         .metadata()
         .context("failed to stat the log file")?
         .len();
-    if len > LOG_READ_CAP {
-        file.seek(SeekFrom::End(-(LOG_READ_CAP as i64)))
-            .context("failed to seek in the log file")?;
-    }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    file.seek(SeekFrom::Start(len.saturating_sub(cap)))
+        .context("failed to seek in the log file")?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
         .context("failed to read the log file")?;
-    for line in tail(&contents, LOG_TAIL_LINES) {
-        println!("{line}");
-    }
-    println!();
-    println!("Follow live: tail -f {}", path.display());
-    Ok(())
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn tail(contents: &str, n: usize) -> Vec<&str> {
@@ -375,6 +384,50 @@ mod tests {
         assert_eq!(t.last(), Some(&"60"));
         assert_eq!(tail("a\nb", 50), vec!["a", "b"], "short logs print whole");
         assert!(tail("", 50).is_empty());
+    }
+
+    #[test]
+    fn a_log_that_is_not_valid_utf8_still_prints() {
+        // The agent's stdout/stderr is not guaranteed to be UTF-8; a mangled
+        // byte must not cost the user the whole log.
+        let dir = crate::test_support::TmpDir::new("logs");
+        let path = dir.join("tapwarden.log");
+        let mut bytes = b"first line\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe]);
+        bytes.extend_from_slice(b"\nlast line\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let contents = read_tail(&path, LOG_READ_CAP).expect("invalid UTF-8 must not fail");
+        assert!(contents.contains("first line"));
+        assert!(contents.contains("last line"));
+    }
+
+    #[test]
+    fn an_oversized_log_is_read_from_the_end_even_mid_character() {
+        let dir = crate::test_support::TmpDir::new("logs");
+        let path = dir.join("tapwarden.log");
+        // A multi-byte character straddles every plausible cap, so the seek
+        // lands mid-character whatever the exact offset.
+        let mut bytes = "日".repeat(200).into_bytes();
+        bytes.extend_from_slice(b"\ntail marker\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let contents = read_tail(&path, 64).expect("a mid-character seek must not fail");
+        assert!(contents.len() <= 64 + 1, "must not read the whole file");
+        assert!(contents.contains("tail marker"));
+    }
+
+    #[test]
+    fn a_missing_log_names_the_path_and_the_command_that_creates_it() {
+        let err = format!(
+            "{:#}",
+            read_tail(
+                std::path::Path::new("/nonexistent/tapwarden.log"),
+                LOG_READ_CAP
+            )
+            .expect_err("a missing log must be an error")
+        );
+        assert!(err.contains("tapwarden start"), "{err}");
     }
 
     #[test]
