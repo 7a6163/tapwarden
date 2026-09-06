@@ -1,0 +1,28 @@
+# cargo-mutants: does the suite actually *catch* a broken change, or only run
+# the line? Only code the offline suite can drive is worth mutating — hardware
+# prompts, launchd, and the real Keychain would report every mutant as missed
+# without telling us anything.
+#
+# The patterns match the whole mutant description ("<file>:<line>:<col>: <what>"),
+# so each one is anchored on the file it applies to.
+
+exclude_globs = [
+    "src/test_support.rs", # the stub server itself
+    "src/keychain.rs",     # every call hits the real macOS Keychain
+]
+
+exclude_re = [
+    # Presence factors: these need a finger or a physical security key.
+    "src/authorizer\\.rs:.*\\b(Biometric|YubikeyTouch|register_yubikey|biometrics_available|yubikey_present)\\b",
+    # launchd lifecycle and the log reader: driving these would install, boot
+    # out, or tail the real background agent.
+    "src/daemon\\.rs:.*\\b(start|stop|uninstall|logs|is_loaded|launchctl|home)\\b",
+    # Binds the real agent socket / waits for process signals.
+    "src/agent\\.rs:.*\\b(run_foreground|shutdown_signal)\\b",
+    # Wizard entry points: they read stdin and the terminal password prompt.
+    "src/setup\\.rs:.*\\b(run|store_bws_token|prompt)\\b",
+]
+
+# The suite finishes in seconds; a mutant that hangs is a finding, not a wait.
+timeout_multiplier = 5.0
+minimum_test_timeout = 30

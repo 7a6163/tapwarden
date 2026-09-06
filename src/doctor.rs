@@ -337,3 +337,254 @@ async fn check_backend_keys(r: &mut Report, cfg: &Config) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secret_source::bws_stub_routes;
+    use crate::test_support::{StubServer, TEST_ED25519_KEY, TmpDir};
+    use uuid::Uuid;
+
+    const KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+    fn parse(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("test config parses")
+    }
+
+    fn write_config(dir: &TmpDir, yaml: &str, mode: u32) -> std::path::PathBuf {
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn report_counts_warnings_and_failures_separately() {
+        let mut r = Report::new();
+        r.line(Status::Ok, "ok-with-detail", "detail");
+        r.line(Status::Ok, "ok-bare", "");
+        r.line(Status::Warn, "warn", "detail");
+        r.line(Status::Fail, "fail", "detail");
+        r.hint("a hint never changes the counts");
+        assert_eq!((r.fails, r.warns), (1, 1));
+    }
+
+    #[test]
+    fn config_check_passes_on_a_readable_0600_file() {
+        let dir = TmpDir::new("doctor");
+        let path = write_config(&dir, &format!("secret_ids: [{KEY_ID}]\n"), 0o600);
+        let mut r = Report::new();
+        let cfg = check_config(&mut r, path.to_str());
+        assert_eq!(cfg.expect("config must load").secret_ids.len(), 1);
+        assert_eq!((r.fails, r.warns), (0, 0));
+    }
+
+    #[test]
+    fn loose_config_permissions_warn_but_do_not_fail() {
+        let dir = TmpDir::new("doctor");
+        let path = write_config(&dir, &format!("secret_ids: [{KEY_ID}]\n"), 0o644);
+        let mut r = Report::new();
+        check_config(&mut r, path.to_str());
+        assert_eq!(
+            (r.fails, r.warns),
+            (0, 1),
+            "a world-readable config is a warning, not a hard failure"
+        );
+    }
+
+    #[test]
+    fn vaultwarden_backend_is_named_in_the_config_line() {
+        let dir = TmpDir::new("doctor");
+        let yaml = format!(
+            "secret_ids: [{KEY_ID}]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: t@example.com\n"
+        );
+        let path = write_config(&dir, &yaml, 0o600);
+        let mut r = Report::new();
+        let cfg = check_config(&mut r, path.to_str()).expect("config must load");
+        assert_eq!(cfg.backend, Backend::Vaultwarden);
+        assert_eq!(r.fails, 0);
+    }
+
+    #[test]
+    fn missing_config_fails_the_report() {
+        let mut r = Report::new();
+        assert!(check_config(&mut r, Some("/nonexistent/tapwarden.yaml")).is_none());
+        assert_eq!(r.fails, 1);
+    }
+
+    #[test]
+    fn permission_check_ignores_a_path_that_is_not_there() {
+        let mut r = Report::new();
+        check_config_perms(&mut r, Path::new("/nonexistent/tapwarden.yaml"));
+        assert_eq!((r.fails, r.warns), (0, 0), "a missing file emits no line");
+    }
+
+    #[test]
+    fn credential_check_covers_every_backend_and_source() {
+        // BWS reading an env var that is not set: a warning with a hint.
+        let mut r = Report::new();
+        check_credentials(
+            &mut r,
+            &parse(&format!(
+                "secret_ids: [{KEY_ID}]\naccess_token_env: TAPWARDEN_TEST_DOCTOR_UNSET\n"
+            )),
+        );
+        assert_eq!((r.fails, r.warns), (0, 1));
+
+        // BWS from the keychain: verified end-to-end only by --check-backend.
+        let mut r = Report::new();
+        check_credentials(
+            &mut r,
+            &parse(&format!("secret_ids: [{KEY_ID}]\ncredentials: keychain\n")),
+        );
+        assert_eq!((r.fails, r.warns), (0, 0));
+
+        // Vaultwarden env vars, none of them set.
+        let mut r = Report::new();
+        check_credentials(
+            &mut r,
+            &parse(&format!(
+                "secret_ids: [{KEY_ID}]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: t@example.com\n  client_id_env: TAPWARDEN_TEST_DOCTOR_UNSET_ID\n  client_secret_env: TAPWARDEN_TEST_DOCTOR_UNSET_SECRET\n  master_password_env: TAPWARDEN_TEST_DOCTOR_UNSET_PW\n"
+            )),
+        );
+        assert_eq!((r.fails, r.warns), (0, 1));
+
+        // Vaultwarden from the keychain.
+        let mut r = Report::new();
+        check_credentials(
+            &mut r,
+            &parse(&format!(
+                "secret_ids: [{KEY_ID}]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: t@example.com\n  credentials: keychain\n"
+            )),
+        );
+        assert_eq!((r.fails, r.warns), (0, 0));
+
+        // A vaultwarden config with no section cannot reach validate(), but
+        // the check must still not panic on it.
+        let mut r = Report::new();
+        check_credentials(
+            &mut r,
+            &parse(&format!("secret_ids: [{KEY_ID}]\nbackend: vaultwarden\n")),
+        );
+        assert_eq!((r.fails, r.warns), (0, 0));
+    }
+
+    #[test]
+    fn vaultwarden_env_credentials_that_are_set_report_ok() {
+        let name = "TAPWARDEN_TEST_VW_VALUE"; // set by .cargo/config.toml
+        let mut r = Report::new();
+        check_credentials(
+            &mut r,
+            &parse(&format!(
+                "secret_ids: [{KEY_ID}]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: t@example.com\n  client_id_env: {name}\n  client_secret_env: {name}\n  master_password_env: {name}\n"
+            )),
+        );
+        assert_eq!((r.fails, r.warns), (0, 0));
+    }
+
+    #[test]
+    fn presence_check_reports_one_line_per_factor_and_never_fails() {
+        // Both probes are capability checks only — neither raises a prompt.
+        for yaml in [
+            format!("secret_ids: [{KEY_ID}]\n"),
+            format!(
+                "secret_ids: [{KEY_ID}]\nauthorization:\n  factor: yubikey\n  yubikey:\n    credential_id: AA==\n"
+            ),
+        ] {
+            let cfg = parse(&yaml);
+            let mut r = Report::new();
+            check_presence(&mut r, Some(&cfg));
+            assert_eq!(r.fails, 0, "a missing presence factor is a warning");
+            assert!(r.warns <= 1);
+        }
+
+        // No config at all falls back to the default factor.
+        let mut r = Report::new();
+        check_presence(&mut r, None);
+        assert_eq!(r.fails, 0);
+    }
+
+    #[test]
+    fn agent_check_inspects_launchd_and_the_socket_without_failing() {
+        let mut r = Report::new();
+        check_agent(&mut r);
+        assert_eq!(
+            r.fails, 0,
+            "launchd/socket state is reported as warnings, never failures"
+        );
+    }
+
+    #[test]
+    fn ssh_wiring_check_never_fails_whatever_the_shell_has_set() {
+        // SSH_AUTH_SOCK cannot be rewritten from a test thread without racing
+        // every concurrent getenv, so all three branches are covered by the
+        // one the ambient environment happens to take. None of them may fail.
+        let mut r = Report::new();
+        check_ssh_wiring(&mut r);
+        assert_eq!(r.fails, 0, "ssh wiring is advice, never a hard failure");
+        assert!(r.warns <= 1);
+    }
+
+    #[tokio::test]
+    async fn backend_check_fails_when_credentials_cannot_be_resolved() {
+        let mut r = Report::new();
+        check_backend_keys(
+            &mut r,
+            &parse(&format!(
+                "secret_ids: [{KEY_ID}]\naccess_token_env: TAPWARDEN_TEST_DOCTOR_UNSET\n"
+            )),
+        )
+        .await;
+        assert_eq!(r.fails, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_check_fails_on_a_key_that_cannot_be_fetched() {
+        let name = "TAPWARDEN_TEST_BWS_TOKEN"; // set by .cargo/config.toml
+        // Token exchange works; the secret itself is not served.
+        let id = Uuid::from_u128(42);
+        let mut routes = bws_stub_routes(id, "n", "k");
+        routes.pop();
+        let server = StubServer::start(routes).await;
+        let mut r = Report::new();
+        check_backend_keys(
+            &mut r,
+            &parse(&format!(
+                "secret_ids: [{id}]\naccess_token_env: {name}\nserver_endpoint: {}\n",
+                server.base_url
+            )),
+        )
+        .await;
+        assert_eq!(r.fails, 2, "one per-key failure plus the summary line");
+    }
+
+    #[tokio::test]
+    async fn run_reports_every_layer_and_fetches_keys_end_to_end() {
+        let name = "TAPWARDEN_TEST_BWS_TOKEN"; // set by .cargo/config.toml
+        let id = Uuid::from_u128(43);
+        let server = StubServer::start(bws_stub_routes(id, "deploy-key", TEST_ED25519_KEY)).await;
+        let dir = TmpDir::new("doctor-run");
+        let path = write_config(
+            &dir,
+            &format!(
+                "secret_ids: [{id}]\naccess_token_env: {name}\nserver_endpoint: {}\n",
+                server.base_url
+            ),
+            0o600,
+        );
+
+        run(path.to_str(), true)
+            .await
+            .expect("every check must pass against the stub backend");
+        // The local-only pass takes the other branch of the --check-backend arm.
+        run(path.to_str(), false).await.expect("local checks pass");
+    }
+
+    #[tokio::test]
+    async fn run_fails_when_the_config_does_not_load() {
+        let err = run(Some("/nonexistent/tapwarden.yaml"), true)
+            .await
+            .expect_err("a config that does not load must exit non-zero");
+        assert!(err.to_string().contains("problem"), "{err:#}");
+    }
+}

@@ -752,4 +752,199 @@ mod tests {
         assert!(validate_email("spaced @example.com").is_err());
         assert!(validate_email("tapwarden@example.com").is_ok());
     }
+
+    // ---- Network helpers against a loopback stub (no network leaves the box).
+    // Nothing here may reach `prompt()`: it reads the real stdin.
+
+    const STUB_EMAIL: &str = "tapwarden@example.com";
+
+    /// The response types deliberately derive no `Debug` (bearer tokens, the
+    /// wrapped user key, the api key), so errors cannot go through `expect_err`.
+    fn err_of<T>(result: Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    async fn stub(routes: Vec<(String, u16, String)>) -> crate::test_support::StubServer {
+        crate::test_support::StubServer::start(routes).await
+    }
+
+    #[tokio::test]
+    async fn prelogin_reads_the_server_kdf_parameters() {
+        let server = stub(vec![(
+            "/identity/accounts/prelogin".to_string(),
+            200,
+            json!({"kdf": 0, "kdfIterations": 600_000}).to_string(),
+        )])
+        .await;
+        let kdf: KdfParams = prelogin(&http_client().unwrap(), &server.base_url, STUB_EMAIL)
+            .await
+            .expect("prelogin must parse")
+            .into();
+        assert_eq!((kdf.kdf, kdf.iterations), (0, 600_000));
+    }
+
+    #[tokio::test]
+    async fn prelogin_http_error_is_reported_without_a_body() {
+        let server = stub(vec![(
+            "/identity/accounts/prelogin".to_string(),
+            500,
+            r#"{"detail":"SUPERSECRETVALUE"}"#.to_string(),
+        )])
+        .await;
+        let err = err_of(prelogin(&http_client().unwrap(), &server.base_url, STUB_EMAIL).await);
+        assert!(err.contains("500"), "{err}");
+        assert!(!err.contains("SUPERSECRETVALUE"), "body leaked: {err}");
+    }
+
+    #[tokio::test]
+    async fn password_login_returns_the_bearer_and_wrapped_user_key() {
+        let server = stub(vec![(
+            "/identity/connect/token".to_string(),
+            200,
+            json!({"access_token": "stub-bearer", "Key": "2.AAAA|AAAA|AAAA"}).to_string(),
+        )])
+        .await;
+        let token = password_login(
+            &http_client().unwrap(),
+            &server.base_url,
+            STUB_EMAIL,
+            "hash",
+        )
+        .await
+        .expect("login must succeed");
+        assert_eq!(token.access_token, "stub-bearer");
+        assert_eq!(token.key, "2.AAAA|AAAA|AAAA");
+    }
+
+    #[tokio::test]
+    async fn login_rejects_two_factor_methods_the_wizard_cannot_drive() {
+        // Provider "3" is a hardware method; only TOTP ("0") is supported, and
+        // this must bail *before* the interactive code prompt.
+        let server = stub(vec![(
+            "/identity/connect/token".to_string(),
+            400,
+            json!({"error": "invalid_grant", "TwoFactorProviders": ["3"]}).to_string(),
+        )])
+        .await;
+        let err = err_of(
+            password_login(
+                &http_client().unwrap(),
+                &server.base_url,
+                STUB_EMAIL,
+                "hash",
+            )
+            .await,
+        );
+        assert!(err.contains("two-factor"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wrong_password_login_error_never_echoes_the_body() {
+        let server = stub(vec![(
+            "/identity/connect/token".to_string(),
+            400,
+            r#"{"error":"invalid_grant","error_description":"SUPERSECRETVALUE"}"#.to_string(),
+        )])
+        .await;
+        let err = err_of(
+            password_login(
+                &http_client().unwrap(),
+                &server.base_url,
+                STUB_EMAIL,
+                "hash",
+            )
+            .await,
+        );
+        assert!(err.contains("400"), "{err}");
+        assert!(!err.contains("SUPERSECRETVALUE"), "body leaked: {err}");
+    }
+
+    #[tokio::test]
+    async fn api_key_profile_and_sync_are_fetched_with_the_bearer() {
+        let id = "b9b64ee8-0000-0000-0000-000000000000";
+        let user = user_key();
+        let server = stub(vec![
+            (
+                "/api/accounts/api-key".to_string(),
+                200,
+                json!({"apiKey": "stub-api-key"}).to_string(),
+            ),
+            (
+                "/api/accounts/profile".to_string(),
+                200,
+                json!({"id": id}).to_string(),
+            ),
+            (
+                "/api/sync".to_string(),
+                200,
+                json!({"ciphers": [{
+                    "id": "11111111-0000-0000-0000-000000000000",
+                    "type": 5, "organizationId": null, "key": null,
+                    "name": make_enc_string(b"deploy-key", &user, [0x0a; 16]),
+                }]})
+                .to_string(),
+            ),
+        ])
+        .await;
+        let http = http_client().unwrap();
+
+        let api_key = fetch_api_key(&http, &server.base_url, "bearer", "hash")
+            .await
+            .unwrap();
+        assert_eq!(api_key.api_key, "stub-api-key");
+        let profile = fetch_profile(&http, &server.base_url, "bearer")
+            .await
+            .unwrap();
+        assert_eq!(format!("user.{}", profile.id), format!("user.{id}"));
+        let sync = fetch_sync(&http, &server.base_url, "bearer").await.unwrap();
+        assert_eq!(
+            ssh_key_items(sync.ciphers, &user).unwrap()[0].1,
+            "deploy-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_profile_and_sync_report_http_errors() {
+        let server = stub(vec![]).await; // every path 404s
+        let http = http_client().unwrap();
+        for err in [
+            err_of(fetch_api_key(&http, &server.base_url, "b", "h").await),
+            err_of(fetch_profile(&http, &server.base_url, "b").await),
+            err_of(fetch_sync(&http, &server.base_url, "b").await),
+        ] {
+            assert!(err.contains("404"), "{err}");
+        }
+    }
+
+    #[test]
+    fn config_file_is_written_0600_and_refuses_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TmpDir::new("setup");
+        let path = dir.join("config.yaml");
+        let contents = render_config(
+            "https://vault.example.com",
+            STUB_EMAIL,
+            &[Uuid::from_u128(1)],
+            CredentialSource::Keychain,
+        )
+        .unwrap();
+
+        write_config_file(&path, &contents).expect("a fresh path must be written");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config must never be group/world readable");
+
+        let planted = dir.join("planted.yaml");
+        std::os::unix::fs::symlink(dir.join("elsewhere.yaml"), &planted).unwrap();
+        write_config_file(&planted, &contents)
+            .expect_err("writing through a pre-planted symlink must be refused");
+    }
+
+    #[test]
+    fn default_config_path_is_the_documented_one() {
+        assert!(config_path().unwrap().ends_with(CONFIG_REL));
+    }
 }

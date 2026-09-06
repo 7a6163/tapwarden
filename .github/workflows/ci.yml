@@ -5,7 +5,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "0 3 * * 1" # weekly audit even without pushes
+    - cron: "0 3 * * 1" # weekly audit + full mutation run, even without pushes
+  workflow_dispatch: # on-demand full mutation run
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,3 +49,32 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit
         run: cargo audit
+
+  mutants:
+    # Coverage proves a line ran; mutation testing proves the suite would
+    # notice if it broke. A full sweep is ~30 minutes, so pull requests mutate
+    # only the lines they changed and the weekly run covers everything.
+    if: github.event_name != 'push'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # --in-diff needs the base branch
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Mutants (changed lines only)
+        if: github.event_name == 'pull_request'
+        run: |
+          git diff "origin/${{ github.base_ref }}..." > pr.diff
+          cargo mutants --in-diff pr.diff
+      - name: Mutants (full)
+        if: github.event_name != 'pull_request'
+        run: cargo mutants
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: mutants-out
+          path: mutants.out/
