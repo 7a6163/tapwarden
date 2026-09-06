@@ -309,8 +309,17 @@ fn service_urls(server_endpoint: Option<&str>) -> Result<(String, String)> {
     if endpoint.contains("://") {
         let url =
             reqwest::Url::parse(endpoint).context("BWS server_endpoint is not a valid URL")?;
-        if url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
-            bail!("BWS server_endpoint must be a base URL without a query or fragment");
+        // Userinfo is rejected here for the same reason as in the bare-host
+        // branch below: reqwest would turn it into a Basic-auth header on every
+        // request, putting a credential somewhere nothing else in tapwarden
+        // expects one.
+        if url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("BWS server_endpoint must be a base URL without credentials, query, or fragment");
         }
         let secure = url.scheme() == "https";
         let loopback_http = url.scheme() == "http"
@@ -678,6 +687,11 @@ mod tests {
         assert!(service_urls(Some("")).is_err());
         assert!(service_urls(Some("vault.example.com/path")).is_err());
         assert!(service_urls(Some("https://vault.example.com?query")).is_err());
+        // Userinfo must be refused in both branches: reqwest would send it as
+        // a Basic-auth header on every request.
+        assert!(service_urls(Some("https://user:pass@vault.example.com")).is_err());
+        assert!(service_urls(Some("https://user@vault.example.com")).is_err());
+        assert!(service_urls(Some("user:pass@vault.example.com")).is_err());
     }
 
     /// Real-BWS integration test. Run explicitly with:
