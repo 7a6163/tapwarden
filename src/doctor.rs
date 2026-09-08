@@ -23,14 +23,22 @@ enum Status {
 struct Report {
     fails: usize,
     warns: usize,
+    /// Every check line emitted, whatever its status — a check that silently
+    /// stops running is otherwise indistinguishable from one that passes.
+    lines: usize,
 }
 
 impl Report {
     fn new() -> Self {
-        Self { fails: 0, warns: 0 }
+        Self {
+            fails: 0,
+            warns: 0,
+            lines: 0,
+        }
     }
 
     fn line(&mut self, status: Status, label: &str, detail: &str) {
+        self.lines += 1;
         let tag = match status {
             Status::Ok => "[ ok ]",
             Status::Warn => {
@@ -210,9 +218,19 @@ fn check_credentials(r: &mut Report, cfg: &Config) {
 
 fn check_presence(r: &mut Report, cfg: Option<&Config>) {
     let factor = cfg.map(|c| c.authorization.factor).unwrap_or_default();
+    // The two probes are the only hardware calls in the process; keeping them
+    // behind this single match is also what keeps the test suite off IOKit.
+    let available = match factor {
+        AuthFactor::TouchId => authorizer::biometrics_available(),
+        AuthFactor::Yubikey => authorizer::yubikey_present(),
+    };
+    report_presence(r, factor, available);
+}
+
+fn report_presence(r: &mut Report, factor: AuthFactor, available: bool) {
     match factor {
         AuthFactor::TouchId => {
-            if authorizer::biometrics_available() {
+            if available {
                 r.line(
                     Status::Ok,
                     "touch id",
@@ -228,7 +246,7 @@ fn check_presence(r: &mut Report, cfg: Option<&Config>) {
             }
         }
         AuthFactor::Yubikey => {
-            if authorizer::yubikey_present() {
+            if available {
                 r.line(Status::Ok, "yubikey", "a FIDO2 security key is connected");
             } else {
                 r.line(Status::Warn, "yubikey", "no FIDO2 security key detected");
@@ -239,7 +257,12 @@ fn check_presence(r: &mut Report, cfg: Option<&Config>) {
 }
 
 fn check_agent(r: &mut Report) {
-    if daemon::is_loaded() {
+    report_launchagent(r, daemon::is_loaded());
+    report_socket(r, runtime_paths::socket_path());
+}
+
+fn report_launchagent(r: &mut Report, loaded: bool) {
+    if loaded {
         r.line(
             Status::Ok,
             "launchagent",
@@ -249,8 +272,10 @@ fn check_agent(r: &mut Report) {
         r.line(Status::Warn, "launchagent", "not loaded in launchd");
         r.hint("start the background agent with `tapwarden start`");
     }
+}
 
-    match runtime_paths::socket_path() {
+fn report_socket(r: &mut Report, socket: Result<std::path::PathBuf>) {
+    match socket {
         Ok(socket) => {
             if !socket.exists() {
                 r.line(
@@ -281,7 +306,11 @@ fn check_ssh_wiring(r: &mut Report) {
     let Ok(socket) = runtime_paths::socket_path() else {
         return;
     };
-    match std::env::var_os("SSH_AUTH_SOCK") {
+    report_ssh_wiring(r, &socket, std::env::var_os("SSH_AUTH_SOCK"));
+}
+
+fn report_ssh_wiring(r: &mut Report, socket: &Path, current: Option<std::ffi::OsString>) {
+    match current {
         Some(val) if Path::new(&val) == socket => {
             r.line(
                 Status::Ok,
@@ -483,6 +512,89 @@ mod tests {
     }
 
     #[test]
+    fn presence_is_reported_per_factor_whether_or_not_it_is_available() {
+        for (factor, available, expect_warn) in [
+            (AuthFactor::TouchId, true, 0),
+            (AuthFactor::TouchId, false, 1),
+            (AuthFactor::Yubikey, true, 0),
+            (AuthFactor::Yubikey, false, 1),
+        ] {
+            let mut r = Report::new();
+            report_presence(&mut r, factor, available);
+            assert_eq!(
+                (r.fails, r.warns),
+                (0, expect_warn),
+                "a missing presence factor is a warning, never a failure ({factor:?}, {available})"
+            );
+        }
+    }
+
+    #[test]
+    fn launchagent_state_is_reported_both_ways() {
+        let mut r = Report::new();
+        report_launchagent(&mut r, true);
+        assert_eq!((r.fails, r.warns), (0, 0));
+
+        let mut r = Report::new();
+        report_launchagent(&mut r, false);
+        assert_eq!(
+            (r.fails, r.warns),
+            (0, 1),
+            "not loaded is advice, not failure"
+        );
+    }
+
+    #[test]
+    fn socket_state_is_reported_for_every_outcome() {
+        let dir = TmpDir::new("doctor-socket");
+
+        // Nothing there at all.
+        let mut r = Report::new();
+        report_socket(&mut r, Ok(dir.join("absent.sock")));
+        assert_eq!((r.fails, r.warns), (0, 1));
+
+        // Exists but does not answer. A just-dropped listener's socket is not
+        // deterministically refused under load, so use a non-socket file: it
+        // takes the identical branch (connect fails with something that is not
+        // NotFound).
+        let stale = dir.join("stale.sock");
+        std::fs::write(&stale, b"not a socket").unwrap();
+        let mut r = Report::new();
+        report_socket(&mut r, Ok(stale));
+        assert_eq!((r.fails, r.warns), (0, 1));
+
+        // A live listener.
+        let live_path = dir.join("live.sock");
+        let live = std::os::unix::net::UnixListener::bind(&live_path).unwrap();
+        let mut r = Report::new();
+        report_socket(&mut r, Ok(live_path));
+        assert_eq!((r.fails, r.warns), (0, 0), "a live socket is the good case");
+        drop(live);
+
+        // The runtime dir could not even be resolved: a hard failure.
+        let mut r = Report::new();
+        report_socket(&mut r, Err(anyhow::anyhow!("no runtime dir")));
+        assert_eq!(r.fails, 1);
+    }
+
+    #[test]
+    fn ssh_auth_sock_is_judged_against_the_tapwarden_socket() {
+        let socket = Path::new("/tmp/tapwarden-test/agent.sock");
+
+        let mut r = Report::new();
+        report_ssh_wiring(&mut r, socket, Some(socket.as_os_str().to_os_string()));
+        assert_eq!((r.fails, r.warns), (0, 0), "a matching socket is ok");
+
+        let mut r = Report::new();
+        report_ssh_wiring(&mut r, socket, Some("/tmp/other-agent.sock".into()));
+        assert_eq!((r.fails, r.warns), (0, 1), "another agent is a warning");
+
+        let mut r = Report::new();
+        report_ssh_wiring(&mut r, socket, None);
+        assert_eq!((r.fails, r.warns), (0, 1), "unset is a warning");
+    }
+
+    #[test]
     fn presence_check_reports_one_line_per_factor_and_never_fails() {
         // Both probes are capability checks only — neither raises a prompt.
         for yaml in [
@@ -496,12 +608,13 @@ mod tests {
             check_presence(&mut r, Some(&cfg));
             assert_eq!(r.fails, 0, "a missing presence factor is a warning");
             assert!(r.warns <= 1);
+            assert_eq!(r.lines, 1, "the presence factor is always reported");
         }
 
         // No config at all falls back to the default factor.
         let mut r = Report::new();
         check_presence(&mut r, None);
-        assert_eq!(r.fails, 0);
+        assert_eq!((r.fails, r.lines), (0, 1));
     }
 
     #[test]
@@ -511,6 +624,10 @@ mod tests {
         assert_eq!(
             r.fails, 0,
             "launchd/socket state is reported as warnings, never failures"
+        );
+        assert_eq!(
+            r.lines, 2,
+            "both the launchagent and the socket are checked"
         );
     }
 
@@ -523,6 +640,7 @@ mod tests {
         check_ssh_wiring(&mut r);
         assert_eq!(r.fails, 0, "ssh wiring is advice, never a hard failure");
         assert!(r.warns <= 1);
+        assert_eq!(r.lines, 1, "the ssh wiring is always reported");
     }
 
     #[tokio::test]

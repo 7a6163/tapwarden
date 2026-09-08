@@ -241,6 +241,14 @@ fn build_authorizer(config: &Config) -> Result<Arc<dyn Authorizer>> {
 }
 
 pub async fn run_foreground(config: Config) -> Result<()> {
+    let socket = runtime_paths::socket_path()?;
+    serve(config, socket).await
+}
+
+/// Serve the agent protocol on `socket` until a shutdown signal. Takes the
+/// path rather than resolving it so tests can drive a real agent on a
+/// throwaway socket instead of the one the user's SSH is pointed at.
+async fn serve(config: Config, socket: std::path::PathBuf) -> Result<()> {
     let secret_ids = config
         .secret_ids
         .iter()
@@ -256,16 +264,51 @@ pub async fn run_foreground(config: Config) -> Result<()> {
         authorizer,
     ));
 
-    let socket = runtime_paths::socket_path()?;
-    // Never hijack a live instance: only remove the socket if nothing answers.
-    match UnixStream::connect(&socket).await {
+    let listener = claim_socket(&socket).await?;
+
+    println!("export SSH_AUTH_SOCK={}", socket.display());
+
+    let result = tokio::select! {
+        r = listen(listener, TapwardenSession(service)) => {
+            r.context("agent listener failed")
+        }
+        _ = shutdown_signal() => Ok(()),
+    };
+    // Cleanup is best-effort and must never mask the listener result.
+    if let Err(e) = release_socket(&socket) {
+        eprintln!(
+            "tapwarden: failed to remove socket {}: {e}",
+            socket.display()
+        );
+    }
+    result
+}
+
+/// Remove the socket we bound. An already-gone socket is success — the point
+/// is that the path is free, not that we were the one to free it.
+fn release_socket(socket: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(socket) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Claim `socket` for a fresh listener.
+///
+/// Never hijacks a live instance — an answering socket is an error, not
+/// something to replace. A socket that refuses the connection was left by a
+/// dead instance and is cleared. The umask is tightened *before* the bind so
+/// the socket is never briefly accessible (no bind-then-chmod race); real
+/// access control is still the 0700 runtime dir.
+async fn claim_socket(socket: &std::path::Path) -> Result<UnixListener> {
+    match UnixStream::connect(socket).await {
         Ok(_) => bail!(
             "another tapwarden instance is already listening on {}",
             socket.display()
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         // Stale socket (connection refused): the previous instance is gone.
-        Err(_) => match std::fs::remove_file(&socket) {
+        Err(_) => match std::fs::remove_file(socket) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -276,36 +319,13 @@ pub async fn run_foreground(config: Config) -> Result<()> {
         },
     }
 
-    // Tighten umask BEFORE binding so the socket is never briefly accessible
-    // (no bind-then-chmod race). Real access control is the 0700 runtime dir.
     // SAFETY: umask() only swaps the process file-mode creation mask; it
     // cannot fail and touches no memory.
     let old_umask = unsafe { libc::umask(0o077) };
-    let listener = UnixListener::bind(&socket);
+    let listener = UnixListener::bind(socket);
     // SAFETY: same as above; restores the mask captured before bind.
     unsafe { libc::umask(old_umask) };
-    let listener =
-        listener.with_context(|| format!("failed to bind socket {}", socket.display()))?;
-
-    println!("export SSH_AUTH_SOCK={}", socket.display());
-
-    let result = tokio::select! {
-        r = listen(listener, TapwardenSession(service)) => {
-            r.context("agent listener failed")
-        }
-        _ = shutdown_signal() => Ok(()),
-    };
-    // Best-effort cleanup: tolerate an already-gone socket and never let a
-    // cleanup failure mask the listener result.
-    if let Err(e) = std::fs::remove_file(&socket)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "tapwarden: failed to remove socket {}: {e}",
-            socket.display()
-        );
-    }
-    result
+    listener.with_context(|| format!("failed to bind socket {}", socket.display()))
 }
 
 async fn shutdown_signal() {
@@ -629,5 +649,145 @@ authorization:
             .await
             .expect_err("a malformed id must fail the probe");
         assert!(err.to_string().contains("not a UUID"), "{err:#}");
+    }
+
+    // ---- Socket lifecycle. Uses a temp path, never the real agent socket.
+
+    /// No assertion on the socket's own mode bits: `umask` is process-global,
+    /// so concurrent tests interleave the save/restore and the observed mode is
+    /// not deterministic. That is also why the design does not rely on those
+    /// bits — access control is the 0700 runtime dir, covered in
+    /// `runtime_paths::tests::runtime_dir_is_private_and_ours`.
+    #[tokio::test]
+    async fn claims_a_free_socket_path() {
+        let dir = crate::test_support::TmpDir::new("agent");
+        let socket = dir.join("agent.sock");
+
+        let listener = claim_socket(&socket).await.expect("a free path must bind");
+        assert!(socket.exists());
+        drop(listener);
+    }
+
+    /// A just-dropped listener's socket is not deterministically refused under
+    /// load, so this plants a non-socket file instead: it reaches the same
+    /// branch (connect fails with something that is not NotFound) every time.
+    #[tokio::test]
+    async fn a_path_that_no_agent_answers_is_cleared_and_rebound() {
+        let dir = crate::test_support::TmpDir::new("agent");
+        let socket = dir.join("agent.sock");
+        std::fs::write(&socket, b"left behind by a dead instance").unwrap();
+
+        let listener = claim_socket(&socket)
+            .await
+            .expect("a path nobody answers is stale, not a live agent");
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_live_agent_is_never_hijacked() {
+        let dir = crate::test_support::TmpDir::new("agent");
+        let socket = dir.join("agent.sock");
+        let live = UnixListener::bind(&socket).unwrap();
+
+        let err = format!(
+            "{:#}",
+            claim_socket(&socket)
+                .await
+                .expect_err("an answering socket must never be taken over")
+        );
+        assert!(err.contains("already listening"), "{err}");
+        drop(live);
+    }
+
+    #[tokio::test]
+    async fn an_unbindable_path_reports_the_socket_it_could_not_take() {
+        let dir = crate::test_support::TmpDir::new("agent");
+        let socket = dir.join("no-such-dir/agent.sock");
+        let err = format!(
+            "{:#}",
+            claim_socket(&socket)
+                .await
+                .expect_err("a bad path cannot bind")
+        );
+        assert!(err.contains("failed to bind socket"), "{err}");
+    }
+
+    /// End-to-end: a real agent on a throwaway socket, driven with the raw
+    /// ssh-agent wire protocol. The only test that exercises the actual
+    /// listener wiring rather than `KeyService` in isolation.
+    #[tokio::test]
+    async fn serves_identities_over_a_real_unix_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const REQUEST_IDENTITIES: u8 = 11;
+        const IDENTITIES_ANSWER: u8 = 12;
+
+        let id = Uuid::from_u128(77);
+        let backend = crate::test_support::StubServer::start(
+            crate::secret_source::bws_stub_routes(id, "deploy-key", TEST_KEY),
+        )
+        .await;
+        let dir = crate::test_support::TmpDir::new("agent-e2e");
+        let socket = dir.join("agent.sock");
+        let config = parse_config(&format!(
+            "secret_ids: [{id}]\naccess_token_env: TAPWARDEN_TEST_BWS_TOKEN\nserver_endpoint: {}\n",
+            backend.base_url
+        ));
+
+        let agent = tokio::spawn(serve(config, socket.clone()));
+        // Bounded: if serve() never binds, fail rather than hang the suite.
+        let mut client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match UnixStream::connect(&socket).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("the agent must bind its socket");
+
+        client
+            .write_all(&[0, 0, 0, 1, REQUEST_IDENTITIES])
+            .await
+            .unwrap();
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).await.unwrap();
+        let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
+        client.read_exact(&mut payload).await.unwrap();
+
+        assert_eq!(payload[0], IDENTITIES_ANSWER);
+        let keys = u32::from_be_bytes(payload[1..5].try_into().unwrap());
+        assert_eq!(keys, 1, "the agent must serve the configured key");
+        // `load_key` prefers the key's own embedded comment over the secret
+        // name, so this is the comment baked into TEST_KEY.
+        let comment = b"unit-test@tapwarden";
+        assert!(
+            payload.windows(comment.len()).any(|w| w == comment),
+            "the identity must carry the key comment"
+        );
+
+        agent.abort();
+    }
+
+    #[test]
+    fn releasing_a_socket_reports_only_the_failures_that_matter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TmpDir::new("agent");
+        let socket = dir.join("agent.sock");
+
+        release_socket(&socket).expect("a socket that was never there is already released");
+        std::fs::write(&socket, b"x").unwrap();
+        release_socket(&socket).expect("our own socket is removed");
+        assert!(!socket.exists());
+
+        // A failure that is not "already gone" must surface to the caller.
+        let locked = crate::test_support::TmpDir::new("agent-locked");
+        let trapped = locked.join("agent.sock");
+        std::fs::write(&trapped, b"x").unwrap();
+        std::fs::set_permissions(&locked.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = release_socket(&trapped).expect_err("an undeletable socket is an error");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        std::fs::set_permissions(&locked.0, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
