@@ -235,8 +235,12 @@ fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -
     let deadline = Instant::now() + launchd.retry_budget;
     let out = loop {
         let out = (launchd.run)(&["bootstrap", &gui_domain(), plist_str])?;
-        if out.status.success() || launchd.is_loaded() || !booted_out || Instant::now() >= deadline
-        {
+        if out.status.success() || launchd.is_loaded() || !booted_out {
+            break out;
+        }
+        // The budget is checked on its own, not as another `||` term: that way
+        // the loop still terminates however the condition above is broken.
+        if Instant::now() >= deadline {
             break out;
         }
         std::thread::sleep(Duration::from_millis(50));
