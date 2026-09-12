@@ -18,7 +18,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 async-trait = "0.1"
 uuid = { version = "1", features = ["serde"] }
-dirs = "6.0"
+dirs = "7.0"
 libc = "0.2"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }  # M1: BWS REST (no SDK)
