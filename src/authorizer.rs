@@ -49,7 +49,7 @@ pub fn biometrics_available() -> bool {
     PolicyBuilder::new()
         .biometrics(Some(BiometricStrength::Strong))
         .password(true)
-        .watch(true)
+        .companion(true)
         .build()
         .is_some()
 }
@@ -76,14 +76,15 @@ impl Authorizer for Biometric {
             AuthContext::UnlockCredentials { reason } => reason.to_string(),
         };
 
-        // blocking_authenticate blocks until the user responds; keep it off the
-        // async runtime. Context/policy are built inside the closure because the
-        // underlying LAContext is not Send.
+        // `authenticate` only *raises* the prompt: the verdict arrives later on
+        // a framework queue, so block a worker thread on the reply rather than
+        // the async runtime. Context/policy are built inside the closure
+        // because the underlying LAContext is not Send.
         let outcome = tokio::task::spawn_blocking(move || {
             let policy = PolicyBuilder::new()
                 .biometrics(Some(BiometricStrength::Strong))
                 .password(true) // DeviceOwnerAuthentication: password fallback allowed
-                .watch(true)
+                .companion(true)
                 .build()
                 .ok_or_else(|| anyhow!("biometric policy not supported on this platform"))?;
             let text = Text {
@@ -95,7 +96,22 @@ impl Authorizer for Biometric {
                 apple: &reason,
                 windows: WindowsText::new_truncated("tapwarden", &reason),
             };
-            match Context::new(()).blocking_authenticate(text, &policy) {
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            // An Err here means the prompt never went up, so the callback will
+            // never fire — return instead of waiting for a reply that is not
+            // coming.
+            Context::new(())
+                .authenticate(text, &policy, move |verdict| {
+                    let _ = tx.send(verdict);
+                })
+                .map_err(|e| anyhow!("could not raise the biometric prompt: {e:?}"))?;
+            // A dropped sender means the prompt ended without answering. No
+            // verdict is not an approval.
+            match rx
+                .recv()
+                .context("the biometric prompt ended without a verdict")?
+            {
                 Ok(()) => Ok(true),
                 // User said no (or failed to authenticate): a denial, not an error.
                 Err(Error::UserCanceled | Error::Authentication) => Ok(false),
