@@ -39,6 +39,20 @@ jobs:
       - name: Build (release)
         run: cargo build --locked --release
 
+  msrv:
+    # `rust-version` in Cargo.toml is published to crates.io, and every
+    # dependency bump can raise the real floor without touching that number.
+    # Every other job here runs on stable, so this is the only thing keeping
+    # the claim honest. `check` is enough — it is the same compile the claim
+    # is about, and re-running the suite on an old toolchain buys nothing.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0 # keep in sync with Cargo.toml's rust-version
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on the declared MSRV
+        run: cargo check --locked --all-targets
+
   audit:
     runs-on: macos-latest
     steps:
