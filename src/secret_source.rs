@@ -595,6 +595,16 @@ mod tests {
     }
 
     #[test]
+    fn a_symmetric_key_of_the_wrong_length_is_refused() {
+        // SymKey has no Debug (it is key material), so no expect_err here.
+        let err = match SymKey::from_bytes(&[0u8; 32]) {
+            Ok(_) => panic!("a 32-byte key must not pass as an enc+mac pair"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("64 bytes"), "{err}");
+    }
+
+    #[test]
     fn access_token_errors_never_echo_the_token() {
         let secret_marker = "SUPERSECRETVALUE";
         let bad = format!("9.{secret_marker}.{secret_marker}:{secret_marker}");
