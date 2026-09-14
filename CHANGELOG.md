@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-09-14
+
+### Changed
+
+- The Touch ID gate now runs on `robius-authentication` 0.3. The prompt and the
+  policy it asks for are unchanged (`DeviceOwnerAuthentication`, so a failed
+  fingerprint still falls back to the account password); the new API returns as
+  soon as the prompt is raised and delivers its verdict through a callback, so
+  the gate waits on a channel and treats a prompt that ends without answering
+  as a denial. The 0.3 Apple backend also refuses an empty prompt reason
+  instead of raising `NSInvalidArgumentException`, and no longer dereferences a
+  null `NSError` or unwinds a panic across the Objective-C frame.
+- Dependency refresh: `argon2` 0.5 → 0.6 (the Vaultwarden KDF, still matching
+  the published SDK vectors), `dirs` 6 → 7, `clap` 4.6.6, `libc` 0.2.189.
+
 ## [0.2.3] - 2026-09-08
 
 ### Fixed
