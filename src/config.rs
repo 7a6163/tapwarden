@@ -245,21 +245,7 @@ impl Config {
             serde_yaml::from_str(&s)
                 .with_context(|| format!("failed to parse {} as YAML", path.display()))?
         } else {
-            // Env fallback (CI / containers): TAPWARDEN_SECRET_IDS is comma-separated.
-            let ids = std::env::var("TAPWARDEN_SECRET_IDS").unwrap_or_default();
-            Config {
-                backend: Backend::default(),
-                vaultwarden: None,
-                access_token_env: default_token_env(),
-                credentials: CredentialSource::default(),
-                secret_ids: ids
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
-                server_endpoint: std::env::var("TAPWARDEN_SERVER_ENDPOINT").ok(),
-                authorization: Authorization::default(),
-            }
+            from_env(&std::env::var("TAPWARDEN_SECRET_IDS").unwrap_or_default())
         };
 
         cfg.validate()?;
@@ -293,6 +279,25 @@ impl Config {
     }
 }
 
+/// Env fallback (CI / containers) for a missing default config file:
+/// `secret_ids` comes from the comma-separated `TAPWARDEN_SECRET_IDS`,
+/// everything else takes its default.
+fn from_env(secret_ids: &str) -> Config {
+    Config {
+        backend: Backend::default(),
+        vaultwarden: None,
+        access_token_env: default_token_env(),
+        credentials: CredentialSource::default(),
+        secret_ids: secret_ids
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        server_endpoint: std::env::var("TAPWARDEN_SERVER_ENDPOINT").ok(),
+        authorization: Authorization::default(),
+    }
+}
+
 fn default_path() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("unable to determine home directory")?
@@ -312,6 +317,42 @@ mod tests {
     use super::*;
 
     const MINIMAL_YAML: &str = "secret_ids: [00000000-0000-0000-0000-000000000000]\n";
+
+    #[test]
+    fn the_env_fallback_parses_a_comma_separated_id_list() {
+        let cfg = from_env(
+            "  00000000-0000-0000-0000-000000000000 ,, 11111111-1111-1111-1111-111111111111,",
+        );
+        assert_eq!(
+            cfg.secret_ids,
+            [
+                "00000000-0000-0000-0000-000000000000",
+                "11111111-1111-1111-1111-111111111111"
+            ],
+            "ids must be trimmed and empty entries dropped"
+        );
+        assert_eq!(cfg.backend, Backend::Bws);
+        assert_eq!(cfg.access_token_env, "BWS_ACCESS_TOKEN");
+        cfg.validate().expect("an env-only config is usable as-is");
+    }
+
+    #[test]
+    fn the_env_fallback_without_any_id_fails_validation() {
+        let err = from_env("")
+            .validate()
+            .expect_err("no config file and no TAPWARDEN_SECRET_IDS is not a usable agent");
+        assert!(err.to_string().contains("TAPWARDEN_SECRET_IDS"), "{err:#}");
+    }
+
+    #[test]
+    fn yubikey_factor_without_a_registered_credential_is_refused() {
+        let yaml = format!("{MINIMAL_YAML}authorization:\n  factor: yubikey\n");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("yubikey factor with no credential must fail closed");
+        assert!(err.to_string().contains("register-yubikey"), "{err:#}");
+    }
 
     #[test]
     fn backend_defaults_to_bws() {

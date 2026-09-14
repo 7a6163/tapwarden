@@ -414,6 +414,23 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn a_non_ed25519_key_is_refused() {
+        let id = Uuid::from_u128(9);
+        let fetcher = FakeFetcher(HashMap::from([(
+            id,
+            crate::test_support::TEST_RSA_KEY.to_string(),
+        )]));
+        let err = format!(
+            "{:#}",
+            load_key(&fetcher, id)
+                .await
+                .err()
+                .expect("an RSA key must be refused, not served")
+        );
+        assert!(err.contains("Ed25519 keys only"), "{err}");
+    }
+
     #[test]
     fn yubikey_authorizer_rejects_malformed_public_key() {
         let config: Config = serde_yaml::from_str(
@@ -502,6 +519,32 @@ authorization:
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].comment, "unit-test@tapwarden");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "listing must never prompt");
+    }
+
+    /// The protocol entry point: both `Session` methods must reach the same
+    /// `KeyService` the direct tests above drive — listing without a prompt,
+    /// signing behind one.
+    #[tokio::test]
+    async fn the_session_delegates_both_protocol_calls_to_the_key_service() {
+        let (service, calls, request) = service_with(true);
+        let mut session = TapwardenSession(Arc::new(service));
+
+        let ids = session
+            .request_identities()
+            .await
+            .expect("listing must succeed");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "listing must never prompt");
+
+        session
+            .sign(request)
+            .await
+            .expect("an approved signature must succeed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "signing must pass the authorizer"
+        );
     }
 
     #[tokio::test]

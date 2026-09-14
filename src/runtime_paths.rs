@@ -30,6 +30,10 @@ pub fn runtime_dir() -> Result<PathBuf> {
         Some(base) => PathBuf::from(base).join("tapwarden"),
         None => std::env::temp_dir().join(format!("tapwarden-{}", uid())),
     };
+    runtime_dir_at(dir)
+}
+
+fn runtime_dir_at(dir: PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create runtime dir {}", dir.display()))?;
     // Reject a pre-planted path BEFORE touching permissions: chmod(2) follows
@@ -73,6 +77,32 @@ mod tests {
         let socket = socket_path().expect("socket_path should succeed");
         assert!(socket.ends_with("agent.sock"));
         assert_eq!(socket.parent(), Some(runtime_dir().unwrap().as_path()));
+    }
+
+    /// The attack the ordering in `runtime_dir_at` exists for: `create_dir_all`
+    /// happily follows a planted symlink to a directory, so the check that
+    /// refuses it has to be a `symlink_metadata` *before* the chmod.
+    #[test]
+    fn a_symlinked_runtime_dir_is_refused_before_it_is_chmodded() {
+        let tmp = crate::test_support::TmpDir::new("runtime");
+        let target = tmp.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let planted = tmp.join("planted");
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().mode() & 0o777;
+        let before = mode(&target);
+
+        let err = format!(
+            "{:#}",
+            runtime_dir_at(planted).expect_err("a symlinked runtime dir must be refused")
+        );
+        assert!(err.contains("not a directory owned by uid"), "{err}");
+        assert_eq!(
+            mode(&target),
+            before,
+            "the symlink target must not have been chmodded"
+        );
     }
 
     #[test]
