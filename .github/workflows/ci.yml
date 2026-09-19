@@ -48,7 +48,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0 # keep in sync with Cargo.toml's rust-version
+      - uses: dtolnay/rust-toolchain@1.120.0 # keep in sync with Cargo.toml's rust-version
       - uses: Swatinem/rust-cache@v2
       - name: Check on the declared MSRV
         run: cargo check --locked --all-targets
