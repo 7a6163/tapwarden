@@ -395,42 +395,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn yubikey_assertion_requires_matching_credential_and_user_presence() {
-        use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion;
-        use ctap_hid_fido2::public_key::PublicKey;
-
-        let credential_id = b"registered";
-        let public_key = PublicKey::default();
-        let challenge = [0u8; 32];
-
-        let mut assertion = Assertion {
-            credential_id: b"different".to_vec(),
-            ..Default::default()
-        };
-        assert!(!yubikey_assertion_is_valid(
-            credential_id,
-            &public_key,
-            &challenge,
-            &assertion
-        ));
-
-        assertion.credential_id = credential_id.to_vec();
-        assert!(!yubikey_assertion_is_valid(
-            credential_id,
-            &public_key,
-            &challenge,
-            &assertion
-        ));
-    }
-
-    #[test]
-    fn yubikey_credential_descriptor_may_be_omitted() {
-        assert!(yubikey_credential_matches(b"registered", b"registered"));
-        assert!(yubikey_credential_matches(b"registered", b""));
-        assert!(!yubikey_credential_matches(b"registered", b"different"));
-    }
-
     #[tokio::test]
     async fn grace_skips_prompt_within_window() {
         let (inner, calls) = counting(true);
@@ -601,5 +565,93 @@ mod tests {
             b"challenge",
             &assertion
         ));
+    }
+
+    /// The accepting path, without a security key: a CTAP2 Ed25519 assertion
+    /// signs `auth_data || SHA256(challenge)`, so a throwaway Ed25519 key can
+    /// produce one the verifier accepts. Everything the gate insists on is
+    /// then flipped one at a time.
+    #[test]
+    fn a_signed_assertion_with_presence_is_the_only_thing_accepted() {
+        use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Assertion;
+        use ctap_hid_fido2::public_key::{PublicKey, PublicKeyType};
+        use sha2::{Digest, Sha256};
+        use signature::Signer as _;
+
+        let signer = ssh_key::PrivateKey::from_openssh(crate::test_support::TEST_ED25519_KEY)
+            .expect("the test key parses");
+        let public_key = PublicKey::with_der(
+            signer
+                .public_key()
+                .key_data()
+                .ed25519()
+                .expect("the test key is Ed25519")
+                .as_ref(),
+            PublicKeyType::Ed25519,
+        );
+        let credential_id = b"registered-credential";
+        let challenge = [7u8; 32];
+        let auth_data = b"authenticator-data".to_vec();
+
+        let mut message = auth_data.clone();
+        message.extend_from_slice(&Sha256::digest(challenge));
+        let signature = signer
+            .try_sign(&message)
+            .expect("signing the assertion message")
+            .as_bytes()
+            .to_vec();
+
+        let valid = Assertion {
+            rpid_hash: Sha256::digest(YUBIKEY_RP_ID.as_bytes()).to_vec(),
+            credential_id: credential_id.to_vec(),
+            auth_data,
+            signature,
+            flags: ctap_hid_fido2::auth_data::Flags {
+                user_present_result: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            yubikey_assertion_is_valid(credential_id, &public_key, &challenge, &valid),
+            "a touched, correctly signed assertion from the registered key is an approval"
+        );
+
+        let mut attested = valid.clone();
+        attested.flags.attested_credential_data_included = true;
+        assert!(
+            !yubikey_assertion_is_valid(credential_id, &public_key, &challenge, &attested),
+            "an assertion carrying attested credential data is not a plain assertion"
+        );
+
+        let mut untouched = valid.clone();
+        untouched.flags.user_present_result = false;
+        assert!(!yubikey_assertion_is_valid(
+            credential_id,
+            &public_key,
+            &challenge,
+            &untouched
+        ));
+
+        let mut other_credential = valid.clone();
+        other_credential.credential_id = b"some-other-credential".to_vec();
+        assert!(!yubikey_assertion_is_valid(
+            credential_id,
+            &public_key,
+            &challenge,
+            &other_credential
+        ));
+
+        assert!(
+            !yubikey_assertion_is_valid(credential_id, &public_key, &[0u8; 32], &valid),
+            "the signature must bind the challenge this process generated"
+        );
+
+        let mut other_rp = valid.clone();
+        other_rp.rpid_hash = Sha256::digest(b"evil.example.com").to_vec();
+        assert!(
+            !yubikey_assertion_is_valid(credential_id, &public_key, &challenge, &other_rp),
+            "an assertion for another relying party is not ours"
+        );
     }
 }

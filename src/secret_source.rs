@@ -702,6 +702,11 @@ mod tests {
         assert!(service_urls(Some("https://user:pass@vault.example.com")).is_err());
         assert!(service_urls(Some("https://user@vault.example.com")).is_err());
         assert!(service_urls(Some("user:pass@vault.example.com")).is_err());
+        // Each bare-host rejection stands on its own: a password with no
+        // username, a query, or a fragment is enough to refuse the endpoint.
+        assert!(service_urls(Some(":pass@vault.example.com")).is_err());
+        assert!(service_urls(Some("vault.example.com?query")).is_err());
+        assert!(service_urls(Some("vault.example.com#fragment")).is_err());
     }
 
     /// Real-BWS integration test. Run explicitly with:
@@ -819,22 +824,114 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn oversized_response_bodies_are_refused() {
-        let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(MAX_RESPONSE_BYTES));
-        let server =
-            crate::test_support::StubServer::start(vec![("/big".to_string(), 200, big)]).await;
+    /// One GET against a stub server through the real client. The server is
+    /// returned with the response because the body is still being streamed:
+    /// the cap logic must run over real chunked reads.
+    async fn stub_get(
+        routes: Vec<(String, u16, String)>,
+        path: &str,
+    ) -> (crate::test_support::StubServer, reqwest::Response) {
+        let server = crate::test_support::StubServer::start(routes).await;
         let response = http_client()
             .unwrap()
-            .get(format!("{}/big", server.base_url))
+            .get(format!("{}{path}", server.base_url))
             .send()
             .await
             .unwrap();
+        (server, response)
+    }
+
+    fn padded_body(bytes: usize) -> String {
+        format!(r#"{{"pad":"{}"}}"#, "x".repeat(bytes))
+    }
+
+    #[tokio::test]
+    async fn the_backend_client_never_follows_a_redirect() {
+        // A 307/308 would replay a credential-bearing POST at whatever origin
+        // a compromised server names, so a redirect is data, never an
+        // instruction.
+        let (_server, response) = stub_get(
+            vec![
+                ("/bounce".to_string(), 302, "/followed".to_string()),
+                (
+                    "/followed".to_string(),
+                    200,
+                    r#"{"followed":true}"#.to_string(),
+                ),
+            ],
+            "/bounce",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            302,
+            "the redirect must come back to the caller, not be followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_response_bodies_are_refused() {
+        let big = padded_body(MAX_RESPONSE_BYTES);
+        let (_server, response) = stub_get(vec![("/big".to_string(), 200, big)], "/big").await;
         let err = format!(
             "{:#}",
             json_capped::<serde_json::Value>(response)
                 .await
                 .expect_err("a body over the cap must be refused")
+        );
+        assert!(err.contains("size limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_response_cap_still_admits_an_ordinary_payload() {
+        // A private key plus metadata is kilobytes; the cap exists to stop a
+        // malicious server from OOMing the agent, not to clip real secrets.
+        let (_server, response) = stub_get(
+            vec![("/ok".to_string(), 200, padded_body(64 * 1024))],
+            "/ok",
+        )
+        .await;
+        let value: serde_json::Value = json_capped(response)
+            .await
+            .expect("a 64 KiB body is well within the cap");
+        assert_eq!(value["pad"].as_str().map(str::len), Some(64 * 1024));
+    }
+
+    #[tokio::test]
+    async fn the_sync_cap_admits_a_vault_the_default_cap_would_refuse() {
+        // `/api/sync` returns the whole vault: multi-MiB accounts are normal,
+        // and only that one call gets the bigger ceiling.
+        const VAULT: usize = 3 * 1024 * 1024;
+        let body = padded_body(VAULT);
+        let (_server, response) =
+            stub_get(vec![("/sync".to_string(), 200, body.clone())], "/sync").await;
+        let value: serde_json::Value = json_capped_limit(response, MAX_SYNC_RESPONSE_BYTES)
+            .await
+            .expect("a 3 MiB vault must survive the sync cap");
+        assert_eq!(value["pad"].as_str().map(str::len), Some(VAULT));
+
+        let (_server, response) = stub_get(vec![("/sync".to_string(), 200, body)], "/sync").await;
+        json_capped::<serde_json::Value>(response)
+            .await
+            .expect_err("the ordinary per-request cap is much lower");
+    }
+
+    #[tokio::test]
+    async fn the_cap_admits_a_body_of_exactly_the_limit_and_nothing_past_it() {
+        let body = r#"{"pad":"exact"}"#.to_string();
+        let limit = body.len();
+
+        let (_server, response) = stub_get(vec![("/x".to_string(), 200, body.clone())], "/x").await;
+        json_capped_limit::<serde_json::Value>(response, limit)
+            .await
+            .expect("a body of exactly the limit fits");
+
+        let (_server, response) = stub_get(vec![("/x".to_string(), 200, body)], "/x").await;
+        let err = format!(
+            "{:#}",
+            json_capped_limit::<serde_json::Value>(response, limit - 1)
+                .await
+                .expect_err("one byte over the limit is refused")
         );
         assert!(err.contains("size limit"), "{err}");
     }

@@ -698,6 +698,31 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_surfaces_a_plist_it_could_not_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TmpDir::new("daemon-locked");
+        let fake = FakeLaunchctl::new(vec![]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+        std::fs::write(&launchd.plist, "plist").unwrap();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = uninstall_in(&launchd);
+        // Restore before asserting: TmpDir must be able to clean itself up.
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = format!(
+            "{:#}",
+            result.expect_err("a plist left in place is not an uninstall")
+        );
+        assert!(err.contains("failed to remove"), "{err}");
+        assert!(
+            launchd.plist.exists(),
+            "the agent is still installed and must be reported as such"
+        );
+    }
+
+    #[test]
     fn logs_prints_from_the_configured_log_path() {
         let dir = crate::test_support::TmpDir::new("daemon");
         let fake = FakeLaunchctl::new(vec![]);
@@ -740,6 +765,23 @@ mod tests {
         let contents = read_tail(&path, 64).expect("a mid-character seek must not fail");
         assert!(contents.len() <= 64 + 1, "must not read the whole file");
         assert!(contents.contains("tail marker"));
+    }
+
+    #[test]
+    fn the_log_cap_is_wide_enough_for_a_real_session() {
+        // `tapwarden logs` is a debugging tool: a log of a few tens of KiB —
+        // an ordinary day of signatures — must come back whole, not clipped
+        // to the last handful of lines.
+        let dir = crate::test_support::TmpDir::new("logs");
+        let path = dir.join("tapwarden.log");
+        let body = "tapwarden: authorized a signature\n".repeat(2000); // ~66 KiB
+        std::fs::write(&path, format!("first line\n{body}")).unwrap();
+
+        let contents = read_tail(&path, LOG_READ_CAP).expect("the log reads");
+        assert!(
+            contents.starts_with("first line\n"),
+            "a 66 KiB log must be read in full, not truncated to a few lines"
+        );
     }
 
     #[test]

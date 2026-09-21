@@ -755,6 +755,28 @@ authorization:
         assert!(err.contains("failed to bind socket"), "{err}");
     }
 
+    /// The other half of `an_unbindable_path_...`: a stale socket that cannot
+    /// be removed must stop the claim, not be papered over and rebound.
+    #[tokio::test]
+    async fn a_stale_socket_that_cannot_be_removed_stops_the_claim() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TmpDir::new("agent-locked");
+        let socket = dir.join("agent.sock");
+        std::fs::write(&socket, b"left behind by a dead instance").unwrap();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let claimed = claim_socket(&socket).await;
+        // Restore before asserting: TmpDir must be able to clean itself up.
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = format!(
+            "{:#}",
+            claimed.expect_err("an undeletable stale socket cannot be claimed")
+        );
+        assert!(err.contains("failed to remove stale socket"), "{err}");
+        assert!(socket.exists(), "the planted socket must be left alone");
+    }
+
     /// End-to-end: a real agent on a throwaway socket, driven with the raw
     /// ssh-agent wire protocol. The only test that exercises the actual
     /// listener wiring rather than `KeyService` in isolation.

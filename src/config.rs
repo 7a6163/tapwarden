@@ -363,6 +363,22 @@ mod tests {
     }
 
     #[test]
+    fn the_grace_window_defaults_to_sixty_seconds() {
+        // The documented default, and the one `grace` mode caches approvals
+        // for: a config that omits it must not silently get a different
+        // window (0 would defeat the mode, a long one would widen exposure).
+        let implicit: Config = serde_yaml::from_str(MINIMAL_YAML).unwrap();
+        assert_eq!(implicit.authorization.grace_seconds, 60);
+        assert_eq!(Authorization::default().grace_seconds, 60);
+
+        let explicit: Config = serde_yaml::from_str(&format!(
+            "{MINIMAL_YAML}authorization:\n  mode: grace\n  grace_seconds: 5\n"
+        ))
+        .unwrap();
+        assert_eq!(explicit.authorization.grace_seconds, 5);
+    }
+
+    #[test]
     fn vaultwarden_backend_requires_its_section() {
         let yaml = format!("{MINIMAL_YAML}backend: vaultwarden\n");
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();

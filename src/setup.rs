@@ -750,6 +750,10 @@ mod tests {
         assert!(yaml_quoted("has\nnewline").is_err());
         assert!(validate_email("no-at-sign").is_err());
         assert!(validate_email("spaced @example.com").is_err());
+        // The email is written into the YAML config as a quoted scalar, so a
+        // quote or a backslash must be refused here too, not escaped later.
+        assert!(validate_email("quo\"te@example.com").is_err());
+        assert!(validate_email("back\\slash@example.com").is_err());
         assert!(validate_email("tapwarden@example.com").is_ok());
     }
 

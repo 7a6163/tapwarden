@@ -24,6 +24,9 @@ impl Drop for StubServer {
 
 impl StubServer {
     /// Serve `(path, status, body)` routes; any other path answers 404.
+    /// A 3xx status makes `body` the `Location` header instead: the response
+    /// is then a redirect, which is what a client's redirect policy is judged
+    /// against.
     pub(crate) async fn start(routes: Vec<(String, u16, String)>) -> Self {
         let routes: Arc<HashMap<String, (u16, String)>> = Arc::new(
             routes
@@ -59,8 +62,13 @@ async fn serve(mut stream: tokio::net::TcpStream, routes: Arc<HashMap<String, (u
         .get(path)
         .cloned()
         .unwrap_or_else(|| (404, "{}".to_string()));
+    let (location, body) = if (300..400).contains(&status) {
+        (format!("Location: {body}\r\n"), String::new())
+    } else {
+        (String::new(), body)
+    };
     let response = format!(
-        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} STATUS\r\n{location}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
