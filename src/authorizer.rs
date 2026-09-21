@@ -293,7 +293,14 @@ impl Approval {
 
     fn within(&self, window: Duration) -> bool {
         // A backwards wall-clock jump makes elapsed() Err → treated as expired.
-        self.instant.elapsed() < window && self.wall.elapsed().is_ok_and(|d| d < window)
+        Self::elapsed_within(self.instant.elapsed(), self.wall.elapsed().ok(), window)
+    }
+
+    /// The window is half-open: an approval exactly `window` old has expired.
+    /// Split from the clock reads so the boundary is testable at all — with
+    /// live clocks no test can land on it.
+    fn elapsed_within(monotonic: Duration, wall: Option<Duration>, window: Duration) -> bool {
+        monotonic < window && wall.is_some_and(|elapsed| elapsed < window)
     }
 }
 
@@ -463,6 +470,26 @@ mod tests {
             wall: SystemTime::now() + Duration::from_secs(120),
         };
         assert!(!approval.within(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn an_approval_exactly_the_window_old_has_expired() {
+        let window = Duration::from_secs(60);
+        let inside = window - Duration::from_nanos(1);
+
+        assert!(Approval::elapsed_within(inside, Some(inside), window));
+        assert!(
+            !Approval::elapsed_within(window, Some(inside), window),
+            "the monotonic clock reaching the window ends it"
+        );
+        assert!(
+            !Approval::elapsed_within(inside, Some(window), window),
+            "the wall clock reaching the window ends it"
+        );
+        assert!(
+            !Approval::elapsed_within(inside, None, window),
+            "a backwards wall-clock step expires the approval"
+        );
     }
 
     #[tokio::test]

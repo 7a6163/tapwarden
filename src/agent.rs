@@ -306,17 +306,11 @@ async fn claim_socket(socket: &std::path::Path) -> Result<UnixListener> {
             "another tapwarden instance is already listening on {}",
             socket.display()
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // Stale socket (connection refused): the previous instance is gone.
-        Err(_) => match std::fs::remove_file(socket) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("failed to remove stale socket {}", socket.display())
-                });
-            }
-        },
+        // Nothing answered: either there is no socket at the path, or a dead
+        // instance left one behind. Either way the path is ours to clear, and
+        // "already gone" is success — same rule as the shutdown cleanup.
+        Err(_) => release_socket(socket)
+            .with_context(|| format!("failed to remove stale socket {}", socket.display()))?,
     }
 
     // SAFETY: umask() only swaps the process file-mode creation mask; it

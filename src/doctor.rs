@@ -26,6 +26,9 @@ struct Report {
     /// Every check line emitted, whatever its status — a check that silently
     /// stops running is otherwise indistinguishable from one that passes.
     lines: usize,
+    /// Same reasoning for the remediation hints: a hint that stops being
+    /// printed leaves the user with a diagnosis and no fix.
+    hints: usize,
 }
 
 impl Report {
@@ -34,6 +37,7 @@ impl Report {
             fails: 0,
             warns: 0,
             lines: 0,
+            hints: 0,
         }
     }
 
@@ -57,7 +61,8 @@ impl Report {
         }
     }
 
-    fn hint(&self, text: &str) {
+    fn hint(&mut self, text: &str) {
+        self.hints += 1;
         println!("       hint: {text}");
     }
 }
@@ -84,19 +89,23 @@ pub async fn run(config_path: Option<&str>, check_backend: bool) -> Result<()> {
     }
 
     println!();
-    if r.fails > 0 {
+    println!("{}", verdict(r.fails, r.warns)?);
+    Ok(())
+}
+
+/// The closing line, or the error that makes `tapwarden doctor` exit non-zero.
+/// Split from `run` so the exit contract is checkable without a real machine
+/// in each of the three states.
+fn verdict(fails: usize, warns: usize) -> Result<String> {
+    if fails > 0 {
         bail!(
-            "doctor found {} problem(s) and {} warning(s) — see the [fail] lines above",
-            r.fails,
-            r.warns
+            "doctor found {fails} problem(s) and {warns} warning(s) — see the [fail] lines above"
         );
     }
-    if r.warns > 0 {
-        println!("doctor: no failures, {} warning(s).", r.warns);
-    } else {
-        println!("doctor: all checks passed.");
+    if warns > 0 {
+        return Ok(format!("doctor: no failures, {warns} warning(s)."));
     }
-    Ok(())
+    Ok("doctor: all checks passed.".to_string())
 }
 
 fn check_config(r: &mut Report, config_path: Option<&str>) -> Option<Config> {
@@ -394,8 +403,27 @@ mod tests {
         r.line(Status::Ok, "ok-bare", "");
         r.line(Status::Warn, "warn", "detail");
         r.line(Status::Fail, "fail", "detail");
-        r.hint("a hint never changes the counts");
-        assert_eq!((r.fails, r.warns), (1, 1));
+        r.hint("a hint never changes the status counts");
+        assert_eq!((r.fails, r.warns, r.lines, r.hints), (1, 1, 4, 1));
+    }
+
+    #[test]
+    fn the_verdict_separates_failures_warnings_and_a_clean_run() {
+        assert_eq!(verdict(0, 0).unwrap(), "doctor: all checks passed.");
+
+        let warned = verdict(0, 3).unwrap();
+        assert!(warned.contains("3 warning(s)"), "{warned}");
+        assert!(
+            !warned.contains("all checks passed"),
+            "warnings must not read as a clean run: {warned}"
+        );
+
+        let failed = format!(
+            "{:#}",
+            verdict(2, 1).expect_err("failures must exit non-zero")
+        );
+        assert!(failed.contains("2 problem(s)"), "{failed}");
+        assert!(failed.contains("1 warning(s)"), "{failed}");
     }
 
     #[test]
@@ -438,7 +466,11 @@ mod tests {
     fn missing_config_fails_the_report() {
         let mut r = Report::new();
         assert!(check_config(&mut r, Some("/nonexistent/tapwarden.yaml")).is_none());
-        assert_eq!(r.fails, 1);
+        assert_eq!(
+            (r.fails, r.hints),
+            (1, 1),
+            "a config that does not load must come with the fix for it"
+        );
     }
 
     #[test]

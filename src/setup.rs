@@ -219,6 +219,7 @@ pub async fn run() -> Result<()> {
     write_config_file(
         &path,
         &render_config(&server_url, &email, &chosen, credentials)?,
+        || prompt("Overwrite it? [y/N]: "),
     )?;
     println!("\nWrote {} (mode 0600, no secrets inside).", path.display());
 
@@ -514,14 +515,18 @@ fn config_path() -> Result<PathBuf> {
 }
 
 /// Write the config with mode 0600; an existing file requires an explicit
-/// y/N confirmation before being overwritten.
-fn write_config_file(path: &std::path::Path, contents: &str) -> Result<()> {
+/// y/N confirmation, which `confirm` supplies (the wizard asks the terminal,
+/// tests answer directly — nothing here may touch the real stdin).
+fn write_config_file(
+    path: &std::path::Path,
+    contents: &str,
+    confirm: impl FnOnce() -> Result<String>,
+) -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     crate::runtime_paths::reject_symlink(path)?;
     if path.exists() {
         println!("Config file {} already exists.", path.display());
-        let answer = prompt("Overwrite it? [y/N]: ")?;
-        if !answer.eq_ignore_ascii_case("y") {
+        if !confirm()?.eq_ignore_ascii_case("y") {
             bail!("aborted: the existing config file was left untouched");
         }
     }
@@ -936,15 +941,49 @@ mod tests {
         )
         .unwrap();
 
-        write_config_file(&path, &contents).expect("a fresh path must be written");
+        let never_asked = || panic!("a fresh path must not ask for confirmation");
+        write_config_file(&path, &contents, never_asked).expect("a fresh path must be written");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config must never be group/world readable");
 
         let planted = dir.join("planted.yaml");
         std::os::unix::fs::symlink(dir.join("elsewhere.yaml"), &planted).unwrap();
-        write_config_file(&planted, &contents)
+        write_config_file(&planted, &contents, never_asked)
             .expect_err("writing through a pre-planted symlink must be refused");
+    }
+
+    #[test]
+    fn an_existing_config_is_overwritten_only_on_an_explicit_yes() {
+        let dir = crate::test_support::TmpDir::new("setup");
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "secret_ids: [the-one-already-there]\n").unwrap();
+        let contents = render_config(
+            "https://vault.example.com",
+            STUB_EMAIL,
+            &[Uuid::from_u128(1)],
+            CredentialSource::Keychain,
+        )
+        .unwrap();
+
+        for answer in ["", "n", "no", "yes please"] {
+            let err = format!(
+                "{:#}",
+                write_config_file(&path, &contents, || Ok(answer.to_string()))
+                    .expect_err("anything but y must abort")
+            );
+            assert!(err.contains("left untouched"), "{answer:?}: {err}");
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("the-one-already-there"),
+                "{answer:?} must not have overwritten the file"
+            );
+        }
+
+        write_config_file(&path, &contents, || Ok("Y".to_string()))
+            .expect("an explicit yes overwrites");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
     }
 
     #[test]
