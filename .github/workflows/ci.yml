@@ -48,7 +48,15 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0 # keep in sync with Cargo.toml's rust-version
+      # The version comes from Cargo.toml, not the action ref: a ref like
+      # `@1.88.0` looks like an action version to dependabot, which then
+      # "bumps" it to a Rust release that does not exist.
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Check on the declared MSRV
         run: cargo check --locked --all-targets
