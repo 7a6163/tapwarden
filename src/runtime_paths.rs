@@ -59,6 +59,17 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("agent.sock"))
 }
 
+/// Give an explicitly chosen socket path the same private parent directory
+/// `runtime_dir` would have built — the LaunchAgent is started with the path
+/// `start` printed, and that dir may have been purged since.
+pub fn ensure_socket_dir(socket: &std::path::Path) -> Result<()> {
+    let parent = socket
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .with_context(|| format!("socket path {} has no parent directory", socket.display()))?;
+    runtime_dir_at(parent.to_path_buf()).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +88,21 @@ mod tests {
         let socket = socket_path().expect("socket_path should succeed");
         assert!(socket.ends_with("agent.sock"));
         assert_eq!(socket.parent(), Some(runtime_dir().unwrap().as_path()));
+    }
+
+    /// An explicit socket path (the one the LaunchAgent is started with) gets
+    /// the same 0700 directory treatment as the derived one: the dir may have
+    /// been purged since `start` created it.
+    #[test]
+    fn an_explicit_socket_path_gets_a_private_parent_dir() {
+        let tmp = crate::test_support::TmpDir::new("runtime");
+        let socket = tmp.join("sub/agent.sock");
+        ensure_socket_dir(&socket).expect("the parent dir is created");
+        let meta = std::fs::metadata(tmp.join("sub")).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        ensure_socket_dir(std::path::Path::new("agent.sock"))
+            .expect_err("a socket path with no parent has nowhere to be private");
     }
 
     /// The attack the ordering in `runtime_dir_at` exists for: `create_dir_all`

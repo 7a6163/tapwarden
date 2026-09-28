@@ -307,28 +307,7 @@ fn service_urls(server_endpoint: Option<&str>) -> Result<(String, String)> {
         .unwrap_or("bitwarden.com")
         .trim_end_matches('/');
     if endpoint.contains("://") {
-        let url =
-            reqwest::Url::parse(endpoint).context("BWS server_endpoint is not a valid URL")?;
-        // Userinfo is rejected here for the same reason as in the bare-host
-        // branch below: reqwest would turn it into a Basic-auth header on every
-        // request, putting a credential somewhere nothing else in tapwarden
-        // expects one.
-        if url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            bail!("BWS server_endpoint must be a base URL without credentials, query, or fragment");
-        }
-        let secure = url.scheme() == "https";
-        let loopback_http = url.scheme() == "http"
-            && url
-                .host_str()
-                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
-        if !secure && !loopback_http {
-            bail!("BWS server_endpoint must use https:// (http:// is allowed for localhost only)");
-        }
+        validate_base_url(endpoint, "BWS server_endpoint")?;
         Ok((format!("{endpoint}/identity"), format!("{endpoint}/api")))
     } else {
         let host_url = reqwest::Url::parse(&format!("https://{endpoint}"))
@@ -347,6 +326,32 @@ fn service_urls(server_endpoint: Option<&str>) -> Result<(String, String)> {
             format!("https://api.{endpoint}"),
         ))
     }
+}
+
+/// A backend base URL: a real host, https (or http to a loopback host only —
+/// cleartext would put credentials and decrypted keys on the wire), and no
+/// userinfo, query, or fragment. Userinfo matters most: reqwest turns it into
+/// a Basic-auth header on every request, putting a credential somewhere
+/// nothing else in tapwarden expects one. Shared by both backends.
+pub(crate) fn validate_base_url(url: &str, what: &str) -> Result<()> {
+    let url = reqwest::Url::parse(url).with_context(|| format!("{what} is not a valid URL"))?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("{what} must be a base URL without credentials, query, or fragment");
+    }
+    let secure = url.scheme() == "https";
+    let loopback_http = url.scheme() == "http"
+        && url
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
+    if !secure && !loopback_http {
+        bail!("{what} must use https:// (http:// is allowed for localhost only)");
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_bws_server_endpoint(server_endpoint: Option<&str>) -> Result<()> {

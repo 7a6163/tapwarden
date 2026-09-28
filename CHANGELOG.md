@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A passphrase-protected OpenSSH key is now refused when the secret is loaded,
+  with an error naming the secret. Its public half is cleartext, so it used to
+  be advertised to SSH and only failed after the user had approved the prompt.
+- Identities are listed in config order. SSH tries keys in the order the agent
+  returns them, and the order used to change between calls and restarts.
+- A secret whose content is unusable (non-Ed25519, passphrase-protected, not an
+  OpenSSH key) is fetched once and then skipped instead of being re-fetched on
+  every request. A failed *fetch* (network, 404) is still retried.
+- The key cache lock is no longer held while a secret is fetched, and `sign`
+  checks the cache before loading. A key that is already in memory is usable
+  while another id's fetch, or the first credential-unlock prompt, is pending.
+- A Touch ID prompt that never delivers a verdict (dismissed by a screen lock,
+  never drawn) now times out after two minutes instead of holding that request,
+  and everyone waiting behind it, forever. The timeout is a failure, not an
+  approval, and the next request prompts again.
+- The LaunchAgent is started with `--socket <path>`, pinning the socket path
+  `tapwarden start` printed. The shell and the launchd GUI domain can disagree
+  on `XDG_RUNTIME_DIR` / `TMPDIR`, which used to leave SSH pointed at a socket
+  the agent never bound. `start --fg --socket` is also available directly.
+- `tapwarden start` (background) now refuses a config that resolves credentials
+  from env vars instead of warning and installing an agent that launchd would
+  restart into a throttled crash loop. Use `start --fg` or `credentials:
+  keychain`.
+- `tapwarden setup` asks whether to overwrite an existing config *before* it
+  writes the new account's credentials to the Keychain. Declining used to leave
+  the old config paired with the new credentials.
+- `[Y/n]` prompts in `tapwarden setup` treat `yes` as yes. It used to count as
+  no, which selected `credentials: env` and printed the client secret.
+
+### Security
+
+- Vaultwarden `server_url` is validated the same way as the BWS endpoint: it
+  must have a host and carry no credentials, query, or fragment. A
+  `https://user:pw@host` URL used to pass and reqwest would have sent the
+  userinfo as a Basic-auth header on every request.
+
 ## [0.2.4] - 2026-09-14
 
 ### Changed

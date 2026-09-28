@@ -174,7 +174,7 @@ pub async fn run() -> Result<()> {
     println!("Obtained the personal API key.");
 
     let answer = prompt("Store credentials in the macOS Keychain? [Y/n]: ")?;
-    let credentials = if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+    let credentials = if answered_yes(&answer, true) {
         CredentialSource::Keychain
     } else {
         CredentialSource::Env
@@ -200,10 +200,13 @@ pub async fn run() -> Result<()> {
         .map(|i| items[i].0)
         .collect();
 
-    // Keychain stores happen BEFORE the config write: a mid-loop failure must
-    // not leave a config on disk that points at keychain entries that were
-    // never stored. (The reverse leftover — entries stored but no config —
-    // is harmless and overwritten by the next setup run.)
+    // Ask about an existing config BEFORE storing anything: declining must
+    // leave the old config paired with its own credentials, not with this
+    // account's. Then keychain stores happen BEFORE the config write: a
+    // mid-loop failure must not leave a config on disk that points at
+    // keychain entries that were never stored.
+    let path = config_path()?;
+    confirm_overwrite(&path, || prompt("Overwrite it? [y/N]: "))?;
     if credentials == CredentialSource::Keychain {
         for (account, value) in [
             (keychain::VW_CLIENT_ID, client_id.as_str()),
@@ -215,11 +218,9 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    let path = config_path()?;
     write_config_file(
         &path,
         &render_config(&server_url, &email, &chosen, credentials)?,
-        || prompt("Overwrite it? [y/N]: "),
     )?;
     println!("\nWrote {} (mode 0600, no secrets inside).", path.display());
 
@@ -514,22 +515,28 @@ fn config_path() -> Result<PathBuf> {
         .join(CONFIG_REL))
 }
 
-/// Write the config with mode 0600; an existing file requires an explicit
-/// y/N confirmation, which `confirm` supplies (the wizard asks the terminal,
-/// tests answer directly — nothing here may touch the real stdin).
-fn write_config_file(
+/// An existing config requires an explicit y/N confirmation, which `confirm`
+/// supplies (the wizard asks the terminal, tests answer directly — nothing
+/// here may touch the real stdin). Runs before the wizard stores anything.
+fn confirm_overwrite(
     path: &std::path::Path,
-    contents: &str,
     confirm: impl FnOnce() -> Result<String>,
 ) -> Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     crate::runtime_paths::reject_symlink(path)?;
     if path.exists() {
         println!("Config file {} already exists.", path.display());
-        if !confirm()?.eq_ignore_ascii_case("y") {
+        if !answered_yes(&confirm()?, false) {
             bail!("aborted: the existing config file was left untouched");
         }
     }
+    Ok(())
+}
+
+/// Write the config with mode 0600. The overwrite question was already asked
+/// by `confirm_overwrite`.
+fn write_config_file(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    crate::runtime_paths::reject_symlink(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("failed to create the config directory")?;
     }
@@ -546,6 +553,18 @@ fn write_config_file(
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .context("failed to set config file permissions")?;
     Ok(())
+}
+
+/// Interpret a y/n answer the way the prompt's capital letter promised. A
+/// `[Y/n]` prompt takes anything but an n-answer as yes (so `yes` is yes);
+/// a `[y/N]` prompt needs an explicit `y` or `yes`.
+fn answered_yes(answer: &str, default_yes: bool) -> bool {
+    let answer = answer.trim().to_ascii_lowercase();
+    if default_yes {
+        !answer.starts_with('n')
+    } else {
+        matches!(answer.as_str(), "y" | "yes")
+    }
 }
 
 fn prompt(label: &str) -> Result<String> {
@@ -941,23 +960,50 @@ mod tests {
         )
         .unwrap();
 
-        let never_asked = || panic!("a fresh path must not ask for confirmation");
-        write_config_file(&path, &contents, never_asked).expect("a fresh path must be written");
+        write_config_file(&path, &contents).expect("a fresh path must be written");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config must never be group/world readable");
 
         let planted = dir.join("planted.yaml");
         std::os::unix::fs::symlink(dir.join("elsewhere.yaml"), &planted).unwrap();
-        write_config_file(&planted, &contents, never_asked)
+        write_config_file(&planted, &contents)
             .expect_err("writing through a pre-planted symlink must be refused");
+        confirm_overwrite(&planted, || {
+            panic!("a symlink is refused before any question")
+        })
+        .expect_err("the overwrite check refuses a planted symlink too");
     }
 
+    /// The question is asked *before* the wizard stores anything: declining
+    /// must leave the old config paired with its own credentials, not with
+    /// the new account's.
     #[test]
     fn an_existing_config_is_overwritten_only_on_an_explicit_yes() {
         let dir = crate::test_support::TmpDir::new("setup");
         let path = dir.join("config.yaml");
+        confirm_overwrite(&path, || {
+            panic!("a fresh path must not ask for confirmation")
+        })
+        .expect("nothing to overwrite");
+
         std::fs::write(&path, "secret_ids: [the-one-already-there]\n").unwrap();
+        for answer in ["", "n", "no", "yes please"] {
+            let err = format!(
+                "{:#}",
+                confirm_overwrite(&path, || Ok(answer.to_string()))
+                    .expect_err("anything but y must abort")
+            );
+            assert!(err.contains("left untouched"), "{answer:?}: {err}");
+        }
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("the-one-already-there"),
+            "asking must not touch the file"
+        );
+
+        confirm_overwrite(&path, || Ok("Y".to_string())).expect("an explicit yes proceeds");
         let contents = render_config(
             "https://vault.example.com",
             STUB_EMAIL,
@@ -965,25 +1011,26 @@ mod tests {
             CredentialSource::Keychain,
         )
         .unwrap();
-
-        for answer in ["", "n", "no", "yes please"] {
-            let err = format!(
-                "{:#}",
-                write_config_file(&path, &contents, || Ok(answer.to_string()))
-                    .expect_err("anything but y must abort")
-            );
-            assert!(err.contains("left untouched"), "{answer:?}: {err}");
-            assert!(
-                std::fs::read_to_string(&path)
-                    .unwrap()
-                    .contains("the-one-already-there"),
-                "{answer:?} must not have overwritten the file"
-            );
-        }
-
-        write_config_file(&path, &contents, || Ok("Y".to_string()))
-            .expect("an explicit yes overwrites");
+        write_config_file(&path, &contents).expect("the confirmed write replaces the file");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    /// Typing `yes` at a `[Y/n]` prompt used to count as *no* — and the no
+    /// branch prints the client secret to the terminal.
+    #[test]
+    fn prompt_answers_follow_the_shown_default() {
+        for yes in ["", "y", "Y", "yes", "YES", "sure"] {
+            assert!(answered_yes(yes, true), "{yes:?} at [Y/n] is yes");
+        }
+        for no in ["n", "N", "no", "NO", "nope"] {
+            assert!(!answered_yes(no, true), "{no:?} at [Y/n] is no");
+        }
+        for yes in ["y", "Y", "yes", "YES"] {
+            assert!(answered_yes(yes, false), "{yes:?} at [y/N] is yes");
+        }
+        for no in ["", "n", "no", "sure", "yes please"] {
+            assert!(!answered_yes(no, false), "{no:?} at [y/N] is no");
+        }
     }
 
     #[test]

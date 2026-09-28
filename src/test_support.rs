@@ -1,5 +1,5 @@
 //! Test-only loopback HTTP stub. Both backends accept plain `http://` for
-//! loopback hosts (see `is_localhost_http` / `service_urls`), so the real
+//! loopback hosts (see `secret_source::validate_base_url`), so the real
 //! reqwest clients can be pointed at this server and the whole protocol
 //! path — request shape, status handling, EncString decryption — runs
 //! unchanged. Keeps the default suite offline: nothing leaves the machine.
@@ -174,5 +174,18 @@ EHWWLmHT8Wojey7hR/Ji1y9CrP+2TX6N2gcZTfUDRvSyBJY+0AAACBAM26gG0b+r3xnz6g
 PHtsRGsORvAIcAhq91C+gOtYnbkpdqKuWEjuYXu20TBTVgTQ/6NoYDfxpskIxAwK1GjbjM
 XpZ4c1GPfo8bvZsZ3i00I+qj/Dtp92KUQoPwi5sC6coRKNJrCSrgvxfbViVVrY9zi6aOmE
 ZEkgoJu4I1SRhgajAAAAEnJzYUB0YXB3YXJkZW4tdGVzdA==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+/// Throwaway Ed25519 key protected with the passphrase "correct horse",
+/// generated for tests only. The public half is cleartext, so the OpenSSH
+/// parser accepts it; the private half cannot sign without the passphrase.
+pub(crate) const TEST_ENCRYPTED_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABA9qvG88n
+iPDVoJa7z0wzg8AAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIDwiNCd3Wxd2XGJg
+7e4b6VVdxk6HxnHM8PJBuyAI2H7QAAAAoPIVBlIxRO5y4K98w7mWBR/zoQj1qzuQRm4LJc
+yrKA4ddfF7hXlxQqUVgxdoO4Bv4BgnlePzLVuDBb+S0akawyJb8n+JsmFd3bFqhL/VdA3j
+AvDsuWpHAqlDQAicf4ZReRBhTuqtsuuasnzOW8bkUsld7SAQT3LOpzEQLF+S3YDA/sR4hE
+u2+PB91noMeiCmEbWzoJw13qDBJmyWqgC8YoY=
 -----END OPENSSH PRIVATE KEY-----
 ";

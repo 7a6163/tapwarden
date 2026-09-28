@@ -6,8 +6,9 @@
 //! "verify the process before signalling" rule is satisfied — there is no
 //! direct-PID path at all, and therefore no PID file.
 //!
-//! The plist contains only the executable path and the log file path — never
-//! credentials, env values, or config contents.
+//! The plist contains only the executable path, the socket path, the log file
+//! path and (if given) the config path — never credentials, env values, or
+//! config contents.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -109,11 +110,12 @@ fn xml_escape(s: &str) -> String {
 ///
 /// No `EnvironmentVariables` on purpose: launchd never sees the user's shell
 /// env, and credentials must not live in the plist. Env-credential configs
-/// (backend `bws`, or `credentials: env`) need `tapwarden start --fg` from a
-/// shell that exports them — or a hand-added EnvironmentVariables dict.
-fn render_plist(exe: &str, log: &str, config_path: Option<&str>) -> String {
+/// (`credentials: env`) are refused by `start` and need `tapwarden start --fg`
+/// from a shell that exports them.
+fn render_plist(exe: &str, log: &str, config_path: Option<&str>, socket: &str) -> String {
     let exe = xml_escape(exe);
     let log = xml_escape(log);
+    let socket = xml_escape(socket);
     let config_args = config_path
         .map(|path| {
             format!(
@@ -134,6 +136,8 @@ fn render_plist(exe: &str, log: &str, config_path: Option<&str>) -> String {
 		<string>{exe}</string>
 		<string>start</string>
 		<string>--fg</string>
+		<string>--socket</string>
+		<string>{socket}</string>
 		{config_args}
 	</array>
 	<key>RunAtLoad</key>
@@ -177,12 +181,14 @@ pub fn start(config: &Config, config_path: Option<&str>) -> Result<()> {
 }
 
 fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -> Result<()> {
+    // Not a warning: under launchd the agent would exit in build_fetcher and
+    // KeepAlive would restart it into a throttled crash loop.
     if uses_env_credentials(config) {
-        eprintln!(
-            "warning: this config resolves credentials from env vars, which launchd does not \
-             provide — the background agent will fail to fetch keys. Either run `tapwarden start \
-             --fg` from a shell that exports them, switch to `credentials: keychain` (`tapwarden \
-             setup`), or add an EnvironmentVariables dict to the plist yourself."
+        bail!(
+            "this config resolves credentials from env vars, which launchd does not provide, so \
+             the background agent could not fetch keys. Either run `tapwarden start --fg` from a \
+             shell that exports them, or switch to `credentials: keychain` (`tapwarden setup` for \
+             Vaultwarden, `tapwarden store-token` for Bitwarden Secrets Manager)."
         );
     }
 
@@ -206,6 +212,12 @@ fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -
         .log
         .to_str()
         .context("the log file path is not valid UTF-8")?;
+    // Resolved once, here: the plist pins it so the agent binds the same path
+    // this shell prints below, whatever launchd's environment looks like.
+    let socket = runtime_paths::socket_path()?;
+    let socket_str = socket
+        .to_str()
+        .context("the socket path is not valid UTF-8")?;
 
     let dir = plist
         .parent()
@@ -216,7 +228,7 @@ fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -
     crate::runtime_paths::reject_symlink(plist)?;
     crate::runtime_paths::reject_symlink(&launchd.log)?;
     // 0644 is fine: the plist holds only the exe path, nothing sensitive.
-    std::fs::write(plist, render_plist(exe, log, config_path))
+    std::fs::write(plist, render_plist(exe, log, config_path, socket_str))
         .with_context(|| format!("failed to write {}", plist.display()))?;
     std::fs::set_permissions(plist, {
         use std::os::unix::fs::PermissionsExt;
@@ -260,7 +272,6 @@ fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -
         );
     }
 
-    let socket = runtime_paths::socket_path()?;
     println!("tapwarden is running in the background (LaunchAgent {LABEL}, starts at login).");
     println!("socket: {}", socket.display());
     println!();
@@ -371,6 +382,7 @@ mod tests {
             "/Users/z a/dev & test/<tapwarden>",
             "/Users/z a/Library/Logs/tapwarden.log",
             None,
+            "/tmp/agent.sock",
         );
         assert!(
             plist.contains("<string>/Users/z a/dev &amp; test/&lt;tapwarden&gt;</string>"),
@@ -381,7 +393,12 @@ mod tests {
 
     #[test]
     fn plist_has_label_args_restart_policy_and_no_env() {
-        let plist = render_plist("/usr/local/bin/tapwarden", "/tmp/tapwarden.log", None);
+        let plist = render_plist(
+            "/usr/local/bin/tapwarden",
+            "/tmp/tapwarden.log",
+            None,
+            "/tmp/agent.sock",
+        );
         assert!(plist.contains("<string>com.tapwarden.agent</string>"));
         assert!(plist.contains("<string>start</string>"));
         assert!(plist.contains("<string>--fg</string>"));
@@ -401,9 +418,25 @@ mod tests {
             "/usr/local/bin/tapwarden",
             "/tmp/tapwarden.log",
             Some("/Users/z a/config & test.yaml"),
+            "/tmp/agent.sock",
         );
         assert!(plist.contains("<string>--config</string>"));
         assert!(plist.contains("<string>/Users/z a/config &amp; test.yaml</string>"));
+    }
+
+    /// The shell that runs `start` and the launchd GUI domain can disagree on
+    /// XDG_RUNTIME_DIR / TMPDIR, so the agent binds the exact path `start`
+    /// printed instead of re-deriving one from launchd's environment.
+    #[test]
+    fn plist_pins_the_socket_path_the_user_was_shown() {
+        let plist = render_plist(
+            "/usr/local/bin/tapwarden",
+            "/tmp/tapwarden.log",
+            None,
+            "/Users/z a/run & go/agent.sock",
+        );
+        assert!(plist.contains("<string>--socket</string>"));
+        assert!(plist.contains("<string>/Users/z a/run &amp; go/agent.sock</string>"));
     }
 
     #[test]
@@ -516,6 +549,11 @@ mod tests {
         let plist = std::fs::read_to_string(&launchd.plist).expect("plist must be written");
         assert!(plist.contains("<string>com.tapwarden.agent</string>"));
         assert!(plist.contains(launchd.log.to_str().unwrap()));
+        let socket = runtime_paths::socket_path().unwrap();
+        assert!(
+            plist.contains(&format!("<string>{}</string>", socket.display())),
+            "the agent must be pointed at the socket `start` prints"
+        );
         let mode = std::fs::metadata(&launchd.plist)
             .unwrap()
             .permissions()
@@ -525,6 +563,33 @@ mod tests {
         assert_eq!(
             fake.subcommands(),
             vec!["bootout", "bootstrap", "kickstart"]
+        );
+    }
+
+    /// launchd never provides the shell's env vars, so an env-credential
+    /// config under launchd can only crash-loop. That is exactly what loading
+    /// the config in `start` exists to prevent, so it is an error, not a note.
+    #[test]
+    fn start_refuses_env_credentials_before_touching_launchd() {
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![]);
+        let run = |args: &[&str]| fake.respond(args);
+        let launchd = fake_launchd(&dir, &run);
+        let env_config: Config = serde_yaml::from_str("secret_ids: [x]\n").unwrap();
+
+        let err = format!(
+            "{:#}",
+            start_in(&launchd, &env_config, None)
+                .expect_err("an agent that cannot fetch keys must not be installed")
+        );
+        assert!(
+            err.contains("--fg"),
+            "must point at the working alternative: {err}"
+        );
+        assert!(!launchd.plist.exists(), "no plist may be written");
+        assert!(
+            fake.subcommands().is_empty(),
+            "launchctl must not be reached"
         );
     }
 

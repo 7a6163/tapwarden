@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::authorizer::{AuthContext, Authorizer, Biometric, Grace, YubikeyTouch};
 use crate::config::{AuthFactor, AuthMode, Backend, Config, CredentialSource};
 use crate::runtime_paths;
-use crate::secret_source::{BwsCredentials, BwsRest, SecretFetcher};
+use crate::secret_source::{BwsCredentials, BwsRest, SecretData, SecretFetcher};
 use crate::vaultwarden::{VaultwardenFetcher, VwCredentials};
 
 struct LoadedKey {
@@ -26,7 +26,12 @@ struct LoadedKey {
 /// Fetch one secret, decode it as an Ed25519 OpenSSH key, and derive its
 /// display comment. Shared by the running agent and `doctor --check-backend`.
 async fn load_key(fetcher: &dyn SecretFetcher, id: Uuid) -> Result<LoadedKey> {
-    let secret = fetcher.get(id).await?;
+    decode_key(fetcher.get(id).await?)
+}
+
+/// The offline half of `load_key`. A failure here is about the secret's
+/// *content*, which does not change until the agent restarts.
+fn decode_key(secret: SecretData) -> Result<LoadedKey> {
     let key = PrivateKey::from_openssh(&secret.openssh_private_key)
         .context("secret value is not an OpenSSH private key")?;
     if key.algorithm() != Algorithm::Ed25519 {
@@ -34,6 +39,12 @@ async fn load_key(fetcher: &dyn SecretFetcher, id: Uuid) -> Result<LoadedKey> {
             "secret \"{}\" holds a {} key — tapwarden serves Ed25519 keys only",
             secret.name,
             key.algorithm()
+        );
+    }
+    if key.is_encrypted() {
+        bail!(
+            "secret \"{}\" holds a passphrase-protected key — tapwarden needs an unencrypted key",
+            secret.name
         );
     }
     let comment = if key.comment().is_empty() {
@@ -75,7 +86,10 @@ struct KeyService {
     secret_ids: Vec<Uuid>,
     fetcher: Box<dyn SecretFetcher>,
     authorizer: Arc<dyn Authorizer>,
-    keys: tokio::sync::Mutex<HashMap<Uuid, LoadedKey>>,
+    /// `None` marks a secret that fetched fine but is not a usable key
+    /// (non-Ed25519, passphrase-protected, not OpenSSH): it is skipped
+    /// instead of being refetched on every request.
+    keys: tokio::sync::Mutex<HashMap<Uuid, Option<LoadedKey>>>,
 }
 
 impl KeyService {
@@ -92,37 +106,63 @@ impl KeyService {
         }
     }
 
-    async fn load_one(&self, id: Uuid) -> Result<LoadedKey> {
-        load_key(self.fetcher.as_ref(), id).await
-    }
-
     /// Lazily fetch any not-yet-loaded secrets. A failure for one id is
     /// reported to stderr (no secret material in the message) and skipped, so
-    /// it never poisons the other keys.
-    // ponytail: failed ids are refetched on every request; cache permanent
-    // failures (e.g. non-Ed25519) if the extra BWS round-trips ever matter.
-    async fn loaded_keys(&self) -> tokio::sync::MutexGuard<'_, HashMap<Uuid, LoadedKey>> {
-        let mut keys = self.keys.lock().await;
-        for id in &self.secret_ids {
-            if keys.contains_key(id) {
-                continue;
-            }
-            match self.load_one(*id).await {
-                Ok(loaded) => {
-                    keys.insert(*id, loaded);
+    /// it never poisons the other keys. A failed *fetch* (network, 404) is
+    /// retried next time; an unusable *secret* is remembered and skipped.
+    ///
+    /// The map lock is never held across a fetch: the first fetch can raise a
+    /// credential-unlock prompt (or wait on the network), and a client whose
+    /// key is already loaded must not queue behind it.
+    async fn loaded_keys(&self) -> tokio::sync::MutexGuard<'_, HashMap<Uuid, Option<LoadedKey>>> {
+        let missing: Vec<Uuid> = {
+            let keys = self.keys.lock().await;
+            self.secret_ids
+                .iter()
+                .filter(|id| !keys.contains_key(id))
+                .copied()
+                .collect()
+        };
+        for id in missing {
+            match self.fetcher.get(id).await {
+                Ok(secret) => {
+                    let decoded = decode_key(secret)
+                        .map_err(|e| eprintln!("tapwarden: skipping secret {id}: {e:#}"))
+                        .ok();
+                    self.keys.lock().await.insert(id, decoded);
                 }
                 Err(e) => eprintln!("tapwarden: skipping secret {id}: {e:#}"),
             }
         }
-        keys
+        self.keys.lock().await
+    }
+
+    /// The loaded key matching `request`, if any. Tries the cache first so a
+    /// key that is already in memory is usable even while another id's fetch
+    /// is still pending; only a miss triggers loading.
+    async fn key_for(&self, request: &SignRequest) -> Option<(PrivateKey, String, String)> {
+        let wanted = request.credential.key_data();
+        let find = |keys: &HashMap<Uuid, Option<LoadedKey>>| {
+            keys.values()
+                .flatten()
+                .find(|k| k.key.public_key().key_data() == wanted)
+                .map(|k| (k.key.clone(), k.comment.clone(), k.fingerprint.clone()))
+        };
+        if let Some(found) = find(&*self.keys.lock().await) {
+            return Some(found);
+        }
+        find(&*self.loaded_keys().await)
     }
 
     /// Public keys + comments only; no authorization prompt (matches
     /// 1Password's agent behavior — listing is not signing).
     async fn identities(&self) -> Vec<Identity> {
-        self.loaded_keys()
-            .await
-            .values()
+        let keys = self.loaded_keys().await;
+        // Config order, not map order: ssh tries keys in the order the agent
+        // lists them, so the order must be stable across calls and restarts.
+        self.secret_ids
+            .iter()
+            .filter_map(|id| keys.get(id)?.as_ref())
             .map(|k| Identity {
                 credential: PublicCredential::Key(k.key.public_key().key_data().clone()),
                 comment: k.comment.clone(),
@@ -131,20 +171,10 @@ impl KeyService {
     }
 
     async fn sign(&self, request: SignRequest) -> Result<Signature, AgentError> {
-        // Clone the key out and drop the lock so a pending Touch ID prompt
-        // doesn't block identity listing from other clients.
-        let (key, comment, fingerprint) = {
-            let keys = self.loaded_keys().await;
-            let entry = keys
-                .values()
-                .find(|k| k.key.public_key().key_data() == request.credential.key_data())
-                .ok_or(AgentError::Failure)?;
-            (
-                entry.key.clone(),
-                entry.comment.clone(),
-                entry.fingerprint.clone(),
-            )
-        };
+        // The key is cloned out and the lock dropped before the prompt, so a
+        // pending Touch ID prompt never blocks other clients.
+        let (key, comment, fingerprint) =
+            self.key_for(&request).await.ok_or(AgentError::Failure)?;
 
         // INVARIANT: every sign passes through the Authorizer before the key
         // is used — this gate is tapwarden's whole point.
@@ -240,8 +270,17 @@ fn build_authorizer(config: &Config) -> Result<Arc<dyn Authorizer>> {
     })
 }
 
-pub async fn run_foreground(config: Config) -> Result<()> {
-    let socket = runtime_paths::socket_path()?;
+/// `socket` is the path the LaunchAgent was installed with (see
+/// `daemon::start`); without one the path is derived from this environment.
+pub async fn run_foreground(config: Config, socket: Option<&str>) -> Result<()> {
+    let socket = match socket {
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            runtime_paths::ensure_socket_dir(&path)?;
+            path
+        }
+        None => runtime_paths::socket_path()?,
+    };
     serve(config, socket).await
 }
 
@@ -342,7 +381,6 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret_source::SecretData;
     use anyhow::anyhow;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -350,6 +388,20 @@ mod tests {
     use crate::test_support::TEST_ED25519_KEY as TEST_KEY;
 
     struct FakeFetcher(HashMap<Uuid, String>);
+
+    /// Like `FakeFetcher`, but counts how often each id is fetched.
+    struct CountingFetcher {
+        secrets: HashMap<Uuid, String>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SecretFetcher for CountingFetcher {
+        async fn get(&self, id: Uuid) -> Result<SecretData> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            FakeFetcher(self.secrets.clone()).get(id).await
+        }
+    }
 
     #[async_trait]
     impl SecretFetcher for FakeFetcher {
@@ -423,6 +475,26 @@ mod tests {
                 .expect("an RSA key must be refused, not served")
         );
         assert!(err.contains("Ed25519 keys only"), "{err}");
+    }
+
+    /// The public half of a passphrase-protected key is cleartext, so the
+    /// parser accepts it and it would be advertised — but every signature
+    /// would fail after the user has already approved the prompt.
+    #[tokio::test]
+    async fn a_passphrase_protected_key_is_refused_at_load() {
+        let id = Uuid::from_u128(10);
+        let fetcher = FakeFetcher(HashMap::from([(
+            id,
+            crate::test_support::TEST_ENCRYPTED_KEY.to_string(),
+        )]));
+        let err = format!(
+            "{:#}",
+            load_key(&fetcher, id)
+                .await
+                .err()
+                .expect("an encrypted key must be refused, not served")
+        );
+        assert!(err.contains("passphrase-protected"), "{err}");
     }
 
     #[test]
@@ -557,6 +629,127 @@ authorization:
             1,
             "the good key must load despite the failing one"
         );
+    }
+
+    /// Deterministic throwaway key: ssh tries keys in the order the agent
+    /// lists them, so the tests need several distinct ones.
+    fn key_with_comment(seed: u8, comment: &str) -> String {
+        use ssh_key::private::{Ed25519Keypair, KeypairData};
+        let pair = Ed25519Keypair::from_seed(&[seed; 32]);
+        PrivateKey::new(KeypairData::Ed25519(pair), comment)
+            .unwrap()
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn identities_are_listed_in_config_order() {
+        let ids: Vec<Uuid> = (1..=5).map(|i| Uuid::from_u128(i * 11)).collect();
+        let fetcher = FakeFetcher(
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| (*id, key_with_comment(i as u8 + 1, &format!("key-{i}"))))
+                .collect(),
+        );
+        let service = KeyService::new(
+            ids,
+            Box::new(fetcher),
+            Arc::new(crate::authorizer::AlwaysAllow),
+        );
+        let comments: Vec<String> = service
+            .identities()
+            .await
+            .into_iter()
+            .map(|i| i.comment)
+            .collect();
+        assert_eq!(
+            comments,
+            ["key-0", "key-1", "key-2", "key-3", "key-4"],
+            "ssh tries keys in agent order, so the order must be the config's"
+        );
+    }
+
+    /// A secret whose *content* is wrong (RSA, encrypted, not a key) stays
+    /// wrong until the agent restarts, so it is fetched once and then skipped;
+    /// a fetch that failed (network, 404) is retried on the next request.
+    #[tokio::test]
+    async fn unusable_secrets_are_not_refetched_but_failed_fetches_are() {
+        let rsa = Uuid::from_u128(1);
+        let missing = Uuid::from_u128(2);
+        let good = Uuid::from_u128(3);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetcher = CountingFetcher {
+            secrets: HashMap::from([
+                (rsa, crate::test_support::TEST_RSA_KEY.to_string()),
+                (good, TEST_KEY.to_string()),
+            ]),
+            fetches: fetches.clone(),
+        };
+        let service = KeyService::new(
+            vec![rsa, missing, good],
+            Box::new(fetcher),
+            Arc::new(crate::authorizer::AlwaysAllow),
+        );
+
+        assert_eq!(service.identities().await.len(), 1);
+        assert_eq!(fetches.load(Ordering::SeqCst), 3, "first pass fetches all");
+        assert_eq!(service.identities().await.len(), 1);
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            4,
+            "second pass must retry only the failed fetch, not the unusable secret"
+        );
+    }
+
+    /// Answers one id immediately and never answers the other — a stand-in
+    /// for a credential-unlock prompt nobody is answering or a backend that is
+    /// not responding.
+    struct StallingFetcher {
+        answers: Uuid,
+        key: String,
+    }
+
+    #[async_trait]
+    impl SecretFetcher for StallingFetcher {
+        async fn get(&self, id: Uuid) -> Result<SecretData> {
+            if id != self.answers {
+                std::future::pending::<()>().await;
+            }
+            Ok(SecretData {
+                name: format!("secret-{id}"),
+                openssh_private_key: self.key.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_fetch_does_not_block_signing_with_a_loaded_key() {
+        let ready = Uuid::from_u128(1);
+        let stalled = Uuid::from_u128(2);
+        let (_, _, request) = service_with(true);
+        let service = Arc::new(KeyService::new(
+            vec![ready, stalled],
+            Box::new(StallingFetcher {
+                answers: ready,
+                key: TEST_KEY.to_string(),
+            }),
+            Arc::new(crate::authorizer::AlwaysAllow),
+        ));
+
+        // Client A lists keys: loads `ready`, then hangs on `stalled` forever.
+        let lister = tokio::spawn({
+            let service = service.clone();
+            async move { service.identities().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Client B signs with the key that is already loaded.
+        tokio::time::timeout(Duration::from_secs(1), service.sign(request))
+            .await
+            .expect("a loaded key must be usable while another fetch is pending")
+            .expect("the approved signature must succeed");
+        lister.abort();
     }
 
     #[tokio::test]

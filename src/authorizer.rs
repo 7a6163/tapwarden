@@ -60,11 +60,40 @@ pub fn biometrics_available() -> bool {
 /// fingerprint read falls back to the account password instead of a hard lockout.
 pub struct Biometric;
 
+/// How long an unanswered Touch ID prompt may hold a request. The framework
+/// gives no verdict at all when the prompt is dismissed by a screen lock or
+/// never drawn, so without a bound every client would wait forever.
+const BIOMETRIC_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Block on the prompt's reply channel. No verdict — dropped sender or
+/// timeout — is never an approval.
+fn await_verdict(
+    rx: std::sync::mpsc::Receiver<Result<(), robius_authentication::Error>>,
+    timeout: Duration,
+) -> Result<bool> {
+    use robius_authentication::Error;
+    use std::sync::mpsc::RecvTimeoutError;
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(true),
+        // User said no (or failed to authenticate): a denial, not an error.
+        Ok(Err(Error::UserCanceled | Error::Authentication)) => Ok(false),
+        // robius Error implements neither Display nor std::error::Error.
+        Ok(Err(e)) => Err(anyhow!("biometric authentication failed: {e:?}")),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("the biometric prompt ended without a verdict"))
+        }
+        Err(RecvTimeoutError::Timeout) => Err(anyhow!(
+            "the biometric prompt timed out after {}s without a verdict",
+            timeout.as_secs()
+        )),
+    }
+}
+
 #[async_trait]
 impl Authorizer for Biometric {
     async fn approve(&self, ctx: &AuthContext<'_>) -> Result<bool> {
         use robius_authentication::{
-            AndroidText, BiometricStrength, Context, Error, PolicyBuilder, Text, WindowsText,
+            AndroidText, BiometricStrength, Context, PolicyBuilder, Text, WindowsText,
         };
 
         // Prompt reads "tapwarden is trying to <reason>" on macOS.
@@ -106,18 +135,7 @@ impl Authorizer for Biometric {
                     let _ = tx.send(verdict);
                 })
                 .map_err(|e| anyhow!("could not raise the biometric prompt: {e:?}"))?;
-            // A dropped sender means the prompt ended without answering. No
-            // verdict is not an approval.
-            match rx
-                .recv()
-                .context("the biometric prompt ended without a verdict")?
-            {
-                Ok(()) => Ok(true),
-                // User said no (or failed to authenticate): a denial, not an error.
-                Err(Error::UserCanceled | Error::Authentication) => Ok(false),
-                // robius Error implements neither Display nor std::error::Error.
-                Err(e) => Err(anyhow!("biometric authentication failed: {e:?}")),
-            }
+            await_verdict(rx, BIOMETRIC_PROMPT_TIMEOUT)
         })
         .await
         .context("biometric prompt task panicked")?;
@@ -361,6 +379,47 @@ impl Authorizer for Grace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- The biometric verdict wait, driven through a bare channel: no prompt.
+
+    #[test]
+    fn biometric_verdict_maps_the_channel_outcomes() {
+        use robius_authentication::Error;
+        let short = Duration::from_millis(20);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        assert!(await_verdict(rx, short).unwrap(), "success approves");
+
+        for denial in [Error::UserCanceled, Error::Authentication] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(Err(denial)).unwrap();
+            assert!(
+                !await_verdict(rx, short).unwrap(),
+                "a denial is not an error"
+            );
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), Error>>();
+        drop(tx);
+        let err = format!("{:#}", await_verdict(rx, short).unwrap_err());
+        assert!(err.contains("without a verdict"), "{err}");
+    }
+
+    /// A prompt nobody answers (screen locked, framework never calls back)
+    /// must not wedge the agent forever: no verdict within the budget is a
+    /// failure the caller can retry, not an approval.
+    #[test]
+    fn biometric_verdict_gives_up_when_nothing_answers() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Result<(), robius_authentication::Error>>();
+        let started = Instant::now();
+        let err = format!(
+            "{:#}",
+            await_verdict(rx, Duration::from_millis(50)).unwrap_err()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(err.contains("timed out"), "{err}");
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

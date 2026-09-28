@@ -255,27 +255,11 @@ enum AuthState {
     Ready(Session),
 }
 
-/// Dev-only exception to the https requirement: plain http is acceptable only
-/// when the traffic never leaves the local machine.
-fn is_localhost_http(url: &str) -> bool {
-    ["http://localhost", "http://127.0.0.1", "http://[::1]"]
-        .iter()
-        .any(|prefix| {
-            url.strip_prefix(prefix).is_some_and(|rest| {
-                rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
-            })
-        })
-}
-
-/// Cleartext http would put credentials and decrypted private keys on the
-/// wire; only a loopback host may skip TLS. Shared with `tapwarden setup`.
+/// Same rules as the BWS endpoint (`secret_source::validate_base_url`): https
+/// or loopback http, no credentials, query, or fragment. Shared with
+/// `tapwarden setup`.
 pub(crate) fn validate_server_url(url: &str) -> Result<()> {
-    if !url.starts_with("https://") && !is_localhost_http(url) {
-        bail!(
-            "vaultwarden server_url must be an https:// URL (http:// is allowed for localhost only)"
-        );
-    }
-    Ok(())
+    crate::secret_source::validate_base_url(url, "vaultwarden server_url")
 }
 
 // No Debug impl on purpose: the struct holds the master password, client
@@ -900,6 +884,36 @@ mod tests {
             Arc::new(crate::authorizer::AlwaysAllow),
         )
         .expect("loopback http server_url is accepted")
+    }
+
+    /// reqwest turns URL userinfo into a Basic-auth header on every request,
+    /// and a query would be glued to every path — the same hazards the BWS
+    /// endpoint check rejects, so the Vaultwarden one must too.
+    #[test]
+    fn server_url_is_validated_as_a_base_url_not_a_prefix() {
+        for ok in [
+            "https://vault.example.com",
+            "https://vault.example.com/",
+            "https://vault.example.com/vw",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            validate_server_url(ok).unwrap_or_else(|e| panic!("{ok} must be accepted: {e:#}"));
+        }
+        for bad in [
+            "https://user:pw@vault.example.com",
+            "https://user@vault.example.com",
+            "https://vault.example.com/?q=1",
+            "https://vault.example.com#frag",
+            "https://",
+            "http://vault.example.com",
+            "http://localhost.evil.com",
+            "ftp://vault.example.com",
+            "vault.example.com",
+        ] {
+            assert!(validate_server_url(bad).is_err(), "{bad} must be refused");
+        }
     }
 
     /// `SecretData` has no `Debug` on purpose, so errors cannot go through

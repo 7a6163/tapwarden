@@ -37,6 +37,10 @@ enum Commands {
         /// Path to the config file
         #[arg(long)]
         config: Option<String>,
+        /// Socket path to bind (set by the LaunchAgent so the agent binds the
+        /// path `tapwarden start` printed; defaults to `tapwarden socket-path`)
+        #[arg(long, requires = "fg")]
+        socket: Option<String>,
     },
     /// Interactive wizard: log in to Vaultwarden once, obtain the personal
     /// API key, pick the SSH keys to serve, and write the config file
@@ -79,12 +83,12 @@ async fn main() -> Result<()> {
 /// from tests without launchd, a terminal, or a security key.
 async fn run(command: Commands) -> Result<()> {
     match command {
-        Commands::Start { fg, config } => {
+        Commands::Start { fg, config, socket } => {
             // Load the config in both paths: an invalid config must fail here,
             // not crash-loop inside a freshly installed LaunchAgent.
             let cfg = Config::load(config.as_deref()).context("failed to load configuration")?;
             if fg {
-                agent::run_foreground(cfg).await?;
+                agent::run_foreground(cfg, socket.as_deref()).await?;
             } else {
                 daemon::start(&cfg, config.as_deref())?;
             }
@@ -128,7 +132,11 @@ mod tests {
     fn subcommands_and_their_flags_parse() {
         assert!(matches!(
             Cli::parse_from(["tapwarden", "start", "--fg", "--config", "/tmp/c.yaml"]).command,
-            Commands::Start { fg: true, config: Some(path) } if path == "/tmp/c.yaml"
+            Commands::Start { fg: true, config: Some(path), socket: None } if path == "/tmp/c.yaml"
+        ));
+        assert!(matches!(
+            Cli::parse_from(["tapwarden", "start", "--fg", "--socket", "/tmp/a.sock"]).command,
+            Commands::Start { socket: Some(path), .. } if path == "/tmp/a.sock"
         ));
         assert!(matches!(
             Cli::parse_from(["tapwarden", "doctor", "--check-backend"]).command,
@@ -185,6 +193,7 @@ mod tests {
             let err = run(Commands::Start {
                 fg,
                 config: Some("/nonexistent/tapwarden.yaml".into()),
+                socket: None,
             })
             .await
             .expect_err("a missing config must stop start in its tracks");
