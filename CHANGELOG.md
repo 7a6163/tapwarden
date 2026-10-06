@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The agent socket moved to `~/Library/Application Support/tapwarden/agent.sock`.
+  It used to live under `$TMPDIR`, which macOS purges of entries nobody touched
+  for a few days: after a long weekend the socket was gone while the agent kept
+  running, and every `ssh` failed until a restart. **Re-run `tapwarden start`
+  and update `IdentityAgent` in `~/.ssh/config`** — keep the quotes, the path
+  contains a space. `start` prints the exact line.
+- An expired backend session is renewed. A 401 on a fetch now logs in again and
+  retries once, so a key whose first fetch failed can still load an hour later.
+  To make that possible with `credentials: env`, the parsed credentials are kept
+  for the agent's life; they were already in its environment the whole time.
+  Keychain credentials are still never kept: renewal re-reads them behind the
+  presence prompt.
+
+### Fixed
+
+- `tapwarden start` rejects a config whose `secret_ids` are not UUIDs or whose
+  Vaultwarden `server_url` is invalid. Both used to pass, install the
+  LaunchAgent, and then crash-loop under launchd.
+- After a failed backend login (offline, server down, unlock prompt dismissed)
+  the agent waits 30 seconds before trying, and prompting, again. Every `ssh`
+  lists keys first, so it used to raise a prompt that could not succeed, once
+  per configured key.
+- Clients that list keys at the same moment share one fetch per key.
+- A key that keeps failing the same way is logged once instead of on every
+  request, so the unrotated agent log no longer grows with every `ssh`.
+- `tapwarden doctor` reads the `IdentityAgent` ssh will actually use (via
+  `ssh -G`) instead of judging only `SSH_AUTH_SOCK`, which macOS always points
+  at its own agent. A Mac set up as the README describes now passes.
+- Snippets printed by `start`, `start --fg` and `doctor` quote the socket path.
+
+### Documentation
+
+- README: install with `cargo install tapwarden`; the status line says
+  self-reviewed rather than security-reviewed; documents the one
+  credential-unlock prompt that listing can raise with `credentials: keychain`;
+  adds rbw to the comparison table.
+
 ## [0.2.5] - 2026-09-28
 
 ### Fixed

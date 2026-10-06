@@ -90,6 +90,14 @@ struct KeyService {
     /// (non-Ed25519, passphrase-protected, not OpenSSH): it is skipped
     /// instead of being refetched on every request.
     keys: tokio::sync::Mutex<HashMap<Uuid, Option<LoadedKey>>>,
+    /// Held across a loading pass so concurrent listings share one fetch per
+    /// key. Separate from `keys`: a key already in the cache stays usable for
+    /// signing while a pass is waiting on the backend or a prompt. Holds the
+    /// last error logged per id, so a repeating failure is logged once.
+    loading: tokio::sync::Mutex<HashMap<Uuid, String>>,
+    /// Where skipped-secret lines go: stderr, which launchd appends to the
+    /// agent log. Replaceable so tests can read what would be logged.
+    log: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 impl KeyService {
@@ -103,6 +111,8 @@ impl KeyService {
             fetcher,
             authorizer,
             keys: tokio::sync::Mutex::new(HashMap::new()),
+            loading: tokio::sync::Mutex::new(HashMap::new()),
+            log: Box::new(|line| eprintln!("{line}")),
         }
     }
 
@@ -113,8 +123,10 @@ impl KeyService {
     ///
     /// The map lock is never held across a fetch: the first fetch can raise a
     /// credential-unlock prompt (or wait on the network), and a client whose
-    /// key is already loaded must not queue behind it.
+    /// key is already loaded must not queue behind it. Concurrent passes wait
+    /// on `loading` and then find the keys the first pass already fetched.
     async fn loaded_keys(&self) -> tokio::sync::MutexGuard<'_, HashMap<Uuid, Option<LoadedKey>>> {
+        let mut last_errors = self.loading.lock().await;
         let missing: Vec<Uuid> = {
             let keys = self.keys.lock().await;
             self.secret_ids
@@ -124,14 +136,24 @@ impl KeyService {
                 .collect()
         };
         for id in missing {
-            match self.fetcher.get(id).await {
+            let failure = match self.fetcher.get(id).await {
                 Ok(secret) => {
-                    let decoded = decode_key(secret)
-                        .map_err(|e| eprintln!("tapwarden: skipping secret {id}: {e:#}"))
-                        .ok();
-                    self.keys.lock().await.insert(id, decoded);
+                    let decoded = decode_key(secret);
+                    let failure = decoded.as_ref().err().map(|e| format!("{e:#}"));
+                    self.keys.lock().await.insert(id, decoded.ok());
+                    failure
                 }
-                Err(e) => eprintln!("tapwarden: skipping secret {id}: {e:#}"),
+                Err(e) => Some(format!("{e:#}")),
+            };
+            match failure {
+                Some(message) if last_errors.get(&id) != Some(&message) => {
+                    (self.log)(&format!("tapwarden: skipping secret {id}: {message}"));
+                    last_errors.insert(id, message);
+                }
+                Some(_) => {}
+                None => {
+                    last_errors.remove(&id);
+                }
             }
         }
         self.keys.lock().await
@@ -305,7 +327,7 @@ async fn serve(config: Config, socket: std::path::PathBuf) -> Result<()> {
 
     let listener = claim_socket(&socket).await?;
 
-    println!("export SSH_AUTH_SOCK={}", socket.display());
+    println!("{}", runtime_paths::export_line(&socket));
 
     let result = tokio::select! {
         r = listen(listener, TapwardenSession(service)) => {
@@ -393,12 +415,15 @@ mod tests {
     struct CountingFetcher {
         secrets: HashMap<Uuid, String>,
         fetches: Arc<AtomicUsize>,
+        /// How long each fetch takes, so concurrent callers overlap.
+        delay: Duration,
     }
 
     #[async_trait]
     impl SecretFetcher for CountingFetcher {
         async fn get(&self, id: Uuid) -> Result<SecretData> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             FakeFetcher(self.secrets.clone()).get(id).await
         }
     }
@@ -685,6 +710,7 @@ authorization:
                 (good, TEST_KEY.to_string()),
             ]),
             fetches: fetches.clone(),
+            delay: Duration::ZERO,
         };
         let service = KeyService::new(
             vec![rsa, missing, good],
@@ -700,6 +726,60 @@ authorization:
             4,
             "second pass must retry only the failed fetch, not the unusable secret"
         );
+    }
+
+    /// launchd appends stderr to a log nothing rotates. A key that fails the
+    /// same way on every request (deleted secret, revoked access) must be
+    /// logged once, not once per `ssh`, and logged again only if the error
+    /// changes.
+    #[tokio::test]
+    async fn a_repeating_failure_is_logged_once() {
+        let missing = Uuid::from_u128(2);
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut service = KeyService::new(
+            vec![missing],
+            Box::new(FakeFetcher(HashMap::new())),
+            Arc::new(crate::authorizer::AlwaysAllow),
+        );
+        service.log = Box::new({
+            let lines = lines.clone();
+            move |line: &str| lines.lock().unwrap().push(line.to_string())
+        });
+
+        for _ in 0..3 {
+            service.identities().await;
+        }
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(&missing.to_string()), "{lines:?}");
+    }
+
+    /// At login, an IDE, a shell and a git fetch can all list keys within the
+    /// same second. They must share one fetch per key, not each repeat it.
+    #[tokio::test]
+    async fn concurrent_listings_fetch_each_key_once() {
+        let id = Uuid::from_u128(1);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(KeyService::new(
+            vec![id],
+            Box::new(CountingFetcher {
+                secrets: HashMap::from([(id, TEST_KEY.to_string())]),
+                fetches: fetches.clone(),
+                delay: Duration::from_millis(50),
+            }),
+            Arc::new(crate::authorizer::AlwaysAllow),
+        ));
+
+        let listings: Vec<_> = (0..3)
+            .map(|_| {
+                let service = service.clone();
+                tokio::spawn(async move { service.identities().await.len() })
+            })
+            .collect();
+        for listing in listings {
+            assert_eq!(listing.await.unwrap(), 1, "every caller sees the key");
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "one fetch, shared");
     }
 
     /// Answers one id immediately and never answers the other — a stand-in

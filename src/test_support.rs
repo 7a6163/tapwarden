@@ -5,7 +5,7 @@
 //! unchanged. Keeps the default suite offline: nothing leaves the machine.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 pub(crate) struct StubServer {
     /// `http://127.0.0.1:<port>` — pass as `server_endpoint` / `server_url`.
     pub(crate) base_url: String,
+    hits: Arc<Mutex<HashMap<String, usize>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -22,30 +23,50 @@ impl Drop for StubServer {
     }
 }
 
+type Routes = Arc<HashMap<String, Vec<(u16, String)>>>;
+
 impl StubServer {
     /// Serve `(path, status, body)` routes; any other path answers 404.
+    /// A path listed more than once answers with each entry in turn and then
+    /// keeps repeating the last one — how a test scripts "401, then 200".
     /// A 3xx status makes `body` the `Location` header instead: the response
     /// is then a redirect, which is what a client's redirect policy is judged
     /// against.
     pub(crate) async fn start(routes: Vec<(String, u16, String)>) -> Self {
-        let routes: Arc<HashMap<String, (u16, String)>> = Arc::new(
-            routes
-                .into_iter()
-                .map(|(path, status, body)| (path, (status, body)))
-                .collect(),
-        );
+        let mut table: HashMap<String, Vec<(u16, String)>> = HashMap::new();
+        for (path, status, body) in routes {
+            table.entry(path).or_default().push((status, body));
+        }
+        let routes: Routes = Arc::new(table);
+        let hits = Arc::new(Mutex::new(HashMap::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(serve(stream, routes.clone()));
+        let task = tokio::spawn({
+            let hits = hits.clone();
+            async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(serve(stream, routes.clone(), hits.clone()));
+                }
             }
         });
-        Self { base_url, task }
+        Self {
+            base_url,
+            hits,
+            task,
+        }
+    }
+
+    /// How many requests reached `path` so far.
+    pub(crate) fn hits(&self, path: &str) -> usize {
+        self.hits.lock().unwrap().get(path).copied().unwrap_or(0)
     }
 }
 
-async fn serve(mut stream: tokio::net::TcpStream, routes: Arc<HashMap<String, (u16, String)>>) {
+async fn serve(
+    mut stream: tokio::net::TcpStream,
+    routes: Routes,
+    hits: Arc<Mutex<HashMap<String, usize>>>,
+) {
     // Drain the whole request before replying: answering mid-body would make
     // the client see a broken pipe on its own write instead of the response.
     let Some(request) = read_request(&mut stream).await else {
@@ -58,9 +79,15 @@ async fn serve(mut stream: tokio::net::TcpStream, routes: Arc<HashMap<String, (u
         .split('?')
         .next()
         .unwrap_or("/");
+    let seen = {
+        let mut hits = hits.lock().unwrap();
+        let n = hits.entry(path.to_string()).or_insert(0);
+        *n += 1;
+        *n - 1
+    };
     let (status, body) = routes
         .get(path)
-        .cloned()
+        .map(|answers| answers[seen.min(answers.len() - 1)].clone())
         .unwrap_or_else(|| (404, "{}".to_string()));
     let (location, body) = if (300..400).contains(&status) {
         (format!("Location: {body}\r\n"), String::new())

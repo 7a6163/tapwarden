@@ -19,18 +19,17 @@ pub(crate) fn reject_symlink(path: &std::path::Path) -> Result<()> {
     }
 }
 
-/// A per-user, 0700 runtime directory that holds the agent socket.
+/// A per-user, 0700 runtime directory that holds the agent socket:
+/// `~/Library/Application Support/tapwarden`.
 ///
-/// Uses `$XDG_RUNTIME_DIR` (already 0700 and owned by the user) when available;
-/// otherwise a uid-suffixed dir under the temp dir. Access control comes from
-/// the *directory* being 0700 — never rely on the socket file's own mode bits
-/// (portability: some BSDs historically ignore them).
+/// Not `$TMPDIR`: macOS purges entries there that nobody touched for a few
+/// days, unlinking a long-lived agent's socket while the agent keeps running.
+/// Not `$XDG_RUNTIME_DIR` either: the shell and launchd disagree on it. Access
+/// control comes from the *directory* being 0700 — never rely on the socket
+/// file's own mode bits (portability: some BSDs historically ignore them).
 pub fn runtime_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(base) => PathBuf::from(base).join("tapwarden"),
-        None => std::env::temp_dir().join(format!("tapwarden-{}", uid())),
-    };
-    runtime_dir_at(dir)
+    let home = dirs::home_dir().context("unable to determine home directory")?;
+    runtime_dir_at(home.join("Library/Application Support/tapwarden"))
 }
 
 fn runtime_dir_at(dir: PathBuf) -> Result<PathBuf> {
@@ -59,6 +58,18 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("agent.sock"))
 }
 
+/// The `~/.ssh/config` line that points ssh at `socket`, quoted because the
+/// default path contains a space.
+pub fn identity_agent_line(socket: &std::path::Path) -> String {
+    format!("IdentityAgent \"{}\"", socket.display())
+}
+
+/// The shell line that points `SSH_AUTH_SOCK` at `socket`, single-quoted.
+pub fn export_line(socket: &std::path::Path) -> String {
+    let quoted = socket.display().to_string().replace('\'', r"'\''");
+    format!("export SSH_AUTH_SOCK='{quoted}'")
+}
+
 /// Give an explicitly chosen socket path the same private parent directory
 /// `runtime_dir` would have built — the LaunchAgent is started with the path
 /// `start` printed, and that dir may have been purged since.
@@ -81,6 +92,41 @@ mod tests {
         assert!(meta.is_dir());
         assert_eq!(meta.uid(), uid());
         assert_eq!(meta.mode() & 0o777, 0o700);
+    }
+
+    /// macOS purges $TMPDIR entries nobody touched for a few days, which
+    /// unlinks a long-lived agent's socket out from under it. The socket must
+    /// live somewhere the system leaves alone, and must not move with the
+    /// caller's environment.
+    #[test]
+    fn socket_lives_outside_the_purged_temp_dir() {
+        let socket = socket_path().unwrap();
+        assert!(
+            socket.ends_with("Library/Application Support/tapwarden/agent.sock"),
+            "{}",
+            socket.display()
+        );
+        assert!(!socket.starts_with(std::env::temp_dir()));
+    }
+
+    /// The socket path has a space in it ("Application Support"); a snippet
+    /// the user pastes unquoted would split it into two arguments.
+    #[test]
+    fn printed_snippets_quote_the_socket_path() {
+        let socket =
+            std::path::Path::new("/Users/z/Library/Application Support/tapwarden/agent.sock");
+        assert_eq!(
+            identity_agent_line(socket),
+            r#"IdentityAgent "/Users/z/Library/Application Support/tapwarden/agent.sock""#
+        );
+        assert_eq!(
+            export_line(socket),
+            "export SSH_AUTH_SOCK='/Users/z/Library/Application Support/tapwarden/agent.sock'"
+        );
+        assert_eq!(
+            export_line(std::path::Path::new("/tmp/it's/agent.sock")),
+            r"export SSH_AUTH_SOCK='/tmp/it'\''s/agent.sock'"
+        );
     }
 
     #[test]

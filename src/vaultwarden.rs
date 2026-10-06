@@ -17,6 +17,7 @@ use hmac::Hmac;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::authorizer::{AuthContext, Authorizer};
@@ -238,21 +239,23 @@ pub struct VaultwardenFetcher {
     /// that gates signatures; `Grace` never applies its window to
     /// `AuthContext::UnlockCredentials`, so credential reads always prompt.
     gate: Arc<dyn Authorizer>,
-    /// Lazily-established session, shared across `get` calls. Env credentials
-    /// live only in `Pending` and are dropped from memory on the first
-    /// successful authenticate; keychain credentials are read, used, and
-    /// dropped inside that same first authenticate.
-    // ponytail: bearer expiry ignored — same rationale as BwsRest; add re-auth
-    // on HTTP 401 if long-lived refetch appears.
+    /// Lazily-established session, shared across `get` calls, renewed when
+    /// the server answers 401 (the bearer expires after two hours by default).
     state: tokio::sync::Mutex<AuthState>,
+    /// `LOGIN_RETRY_BACKOFF`; a field so tests need not wait it out.
+    login_backoff: Duration,
 }
 
-enum AuthState {
-    /// Credential source held only until the first successful login; a failed
-    /// attempt (or a denied unlock) leaves it in place so a later `get` can
-    /// retry.
-    Pending(VwCredentials),
-    Ready(Session),
+/// Where to log in from, plus the current session if there is one. Env
+/// credentials are kept so an expired session can be renewed; that adds no
+/// exposure, since the same values stay in the process environment for the
+/// agent's whole life. Keychain credentials are never kept: each login reads,
+/// uses, and drops them behind the presence gate.
+struct AuthState {
+    source: VwCredentials,
+    session: Option<Session>,
+    /// When the last login failed, for `LOGIN_RETRY_BACKOFF`.
+    failed_at: Option<Instant>,
 }
 
 /// Same rules as the BWS endpoint (`secret_source::validate_base_url`): https
@@ -290,7 +293,12 @@ impl VaultwardenFetcher {
             email: email.to_string(),
             http: http_client()?,
             gate,
-            state: tokio::sync::Mutex::new(AuthState::Pending(credentials)),
+            state: tokio::sync::Mutex::new(AuthState {
+                source: credentials,
+                session: None,
+                failed_at: None,
+            }),
+            login_backoff: crate::secret_source::LOGIN_RETRY_BACKOFF,
         })
     }
 
@@ -320,8 +328,8 @@ impl VaultwardenFetcher {
                     .await
                     .context("failed to evaluate the credential-unlock authorization")?;
                 if !approved {
-                    // Static message; state stays Pending so the next request
-                    // can raise the prompt again.
+                    // Static message; no session is stored, so a later
+                    // request prompts again once the login backoff passes.
                     bail!("credential unlock denied — the keychain was not read");
                 }
                 let client_id = keychain::read(keychain::VW_CLIENT_ID)?;
@@ -415,29 +423,57 @@ impl VaultwardenFetcher {
 impl SecretFetcher for VaultwardenFetcher {
     async fn get(&self, id: Uuid) -> Result<SecretData> {
         let mut state = self.state.lock().await;
-        if let AuthState::Pending(pending) = &*state {
-            let (client_id, client_secret, master_password) =
-                self.acquire_credentials(pending).await?;
-            let session = self
-                .authenticate(&client_id, &client_secret, &master_password)
-                .await?;
-            // Success: replacing the state drops the credentials from memory
-            // (the keychain-read copies go out of scope right here too).
-            *state = AuthState::Ready(session);
+        // At most two attempts: the second runs only after a 401, on a fresh
+        // login. Bounded by the range, so no change to the condition below can
+        // turn it into an endless loop.
+        let mut response = None;
+        for attempt in 0..2 {
+            if state.session.is_none() {
+                crate::secret_source::check_login_backoff(state.failed_at, self.login_backoff)?;
+                let login = match self.acquire_credentials(&state.source).await {
+                    Ok((client_id, client_secret, master_password)) => {
+                        self.authenticate(&client_id, &client_secret, &master_password)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+                // The keychain-read copies went out of scope with the match.
+                match login {
+                    Ok(session) => {
+                        state.session = Some(session);
+                        state.failed_at = None;
+                    }
+                    Err(e) => {
+                        state.failed_at = Some(Instant::now());
+                        return Err(e);
+                    }
+                }
+            }
+            let Some(session) = &state.session else {
+                bail!("no session established");
+            };
+            let fetched = self
+                .http
+                .get(format!("{}/api/ciphers/{}", self.server_url, id))
+                .bearer_auth(&session.bearer)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
+                .send()
+                .await
+                .context("cipher fetch failed: request error")?;
+            if fetched.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                state.session = None;
+                continue;
+            }
+            response = Some(fetched);
+            break;
         }
-        let AuthState::Ready(session) = &*state else {
-            bail!("credentials already consumed but no session established");
+        let Some(response) = response else {
+            bail!("no session established");
         };
-
-        let response = self
-            .http
-            .get(format!("{}/api/ciphers/{}", self.server_url, id))
-            .bearer_auth(&session.bearer)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
-            .send()
-            .await
-            .context("cipher fetch failed: request error")?;
+        let Some(session) = &state.session else {
+            bail!("no session established");
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -793,13 +829,16 @@ mod tests {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let fetcher = VaultwardenFetcher::new(
+        let mut fetcher = VaultwardenFetcher::new(
             "https://vault.example.com",
             "a@b.c",
             VwCredentials::Keychain,
             Arc::new(Denying(calls.clone())),
         )
         .unwrap();
+        // The retry wait itself is covered by
+        // `a_failed_login_is_not_retried_until_the_backoff_passes`.
+        fetcher.login_backoff = Duration::ZERO;
 
         let id = Uuid::from_u128(1);
         for expected_calls in [1, 2] {
@@ -925,6 +964,71 @@ mod tests {
         }
     }
 
+    /// Counts prompts; always says no.
+    struct DenyingGate(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Authorizer for DenyingGate {
+        async fn approve(&self, _ctx: &AuthContext<'_>) -> Result<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(false)
+        }
+    }
+
+    /// Same contract as the BWS fetcher: after a failed login, no new unlock
+    /// prompt until the backoff has passed.
+    #[tokio::test]
+    async fn a_failed_login_is_not_retried_until_the_backoff_passes() {
+        let gate = Arc::new(DenyingGate(Default::default()));
+        let mut fetcher = VaultwardenFetcher::new(
+            "https://vault.example.com",
+            STUB_EMAIL,
+            VwCredentials::Keychain,
+            gate.clone(),
+        )
+        .unwrap();
+        fetcher.login_backoff = Duration::from_millis(200);
+        let prompts = || gate.0.load(std::sync::atomic::Ordering::SeqCst);
+
+        err_of(fetcher.get(Uuid::from_u128(1)).await);
+        assert_eq!(prompts(), 1);
+        let err = err_of(fetcher.get(Uuid::from_u128(2)).await);
+        assert_eq!(
+            prompts(),
+            1,
+            "a second key within the backoff must not prompt"
+        );
+        assert!(err.contains("retrying"), "{err}");
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        err_of(fetcher.get(Uuid::from_u128(1)).await);
+        assert_eq!(prompts(), 2, "after the backoff the login is tried again");
+    }
+
+    /// Same contract as the BWS fetcher: the bearer expires (two hours by
+    /// default on Vaultwarden), and a 401 must renew the session once.
+    #[tokio::test]
+    async fn an_expired_bearer_is_renewed_on_401() {
+        let id = Uuid::from_u128(9);
+        let cipher_path = format!("/api/ciphers/{id}");
+        let mut routes = vec![(cipher_path.clone(), 401, "{}".to_string())];
+        routes.extend(vw_stub_routes(id, "deploy-key", "PRIVATE-KEY-MATERIAL"));
+        let server = crate::test_support::StubServer::start(routes).await;
+        let fetcher = stub_fetcher(&server.base_url, STUB_PASSWORD);
+
+        let secret = fetcher
+            .get(id)
+            .await
+            .expect("a renewed session must fetch the cipher");
+        assert_eq!(secret.name, "deploy-key");
+        assert_eq!(
+            server.hits("/identity/connect/token"),
+            2,
+            "401 must re-authenticate"
+        );
+        assert_eq!(server.hits(&cipher_path), 2, "and retry the fetch once");
+    }
+
     #[tokio::test]
     async fn logs_in_and_decrypts_an_ssh_key_cipher() {
         let id = Uuid::from_u128(9);
@@ -942,6 +1046,11 @@ mod tests {
 
         // The session is cached: a second fetch must not re-authenticate.
         assert_eq!(fetcher.get(id).await.unwrap().name, "deploy-key");
+        assert_eq!(
+            server.hits("/identity/connect/token"),
+            1,
+            "one login, reused"
+        );
     }
 
     #[tokio::test]

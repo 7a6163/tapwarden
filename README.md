@@ -9,7 +9,7 @@ a headless / least-privilege Bitwarden backend.
 
 Status: **working agent** — Touch ID verified from an unsigned binary, both
 backends implemented against the official SDK's protocol and test vectors,
-security-reviewed; the BWS access token and Vaultwarden credentials can live in
+self-reviewed (no third-party audit yet); the BWS access token and Vaultwarden credentials can live in
 the macOS Keychain behind Touch ID; a YubiKey/FIDO2 touch works as an
 alternative presence factor; runs in the background as a LaunchAgent
 (`start`/`stop`/`logs`/`uninstall`), with a `doctor` diagnostics command.
@@ -22,6 +22,7 @@ Roadmap: Developer ID signing + notarization, Homebrew packaging, Linux support.
 | 1Password agent | 1Password vault | ✅ Touch ID |
 | Bitwarden GUI agent | personal vault | ❌ manual unlock |
 | vault-conductor / bw-agent | SM / secure notes | ❌ silent signing |
+| rbw (`rbw-agent`, 1.14+) | personal vault (cloud or self-hosted) | ❌ signs silently while unlocked (default 1 h idle timeout) |
 | **tapwarden** | **Secrets Manager or Vaultwarden (scoped)** | ✅ Touch ID per signature |
 
 Two guarantees the alternatives don't give you together:
@@ -38,8 +39,16 @@ Private keys exist in memory only. Nothing is ever written to disk or logged.
 
 - macOS with Touch ID (the biometric prompt works from an unsigned binary —
   verified; Linux support is a future milestone)
-- Rust 1.88+ (`cargo build --release` → `target/release/tapwarden`)
+- Rust 1.88+ to build it
 - One of the two backends below
+
+```sh
+cargo install tapwarden    # from crates.io → ~/.cargo/bin/tapwarden
+```
+
+Or from a checkout: `cargo build --release` → `target/release/tapwarden`.
+Either way, see [Code signing](#code-signing-optional-recommended) to stop
+the keychain from re-prompting after every upgrade.
 
 ## Setup
 
@@ -139,21 +148,28 @@ export TAPWARDEN_VW_MASTER_PASSWORD='...'
 tapwarden start    # background LaunchAgent: restarts on crash, starts at login
 ```
 
-`start` prints the socket path. Point SSH at it permanently — no `export`
-needed in any shell:
+`start` prints the socket path and the exact line to add. Point SSH at it
+permanently — no `export` needed in any shell. Keep the quotes: the path
+contains a space.
 
 ```sh
 # ~/.ssh/config
 Host *
-  IdentityAgent <output of `tapwarden socket-path`>
+  IdentityAgent "~/Library/Application Support/tapwarden/agent.sock"
 ```
 
 Then:
 
 ```sh
-ssh-add -L      # lists public keys, no prompt
+ssh-add -L      # lists public keys, never a signing prompt
 ssh somehost    # ← Touch ID prompt per signature
 ```
+
+Listing never asks to *sign*. With `credentials: keychain`, though, the first
+listing after the agent starts raises one prompt to unlock the backend
+credentials, since the keys cannot be fetched without them. If that login
+fails (offline, prompt dismissed), the agent waits 30 seconds before asking
+again rather than prompting on every `ssh`.
 
 Manage it:
 
@@ -165,13 +181,11 @@ tapwarden uninstall    # stop the agent and remove the LaunchAgent
 tapwarden start --fg   # debug: run in the foreground of the current shell
 ```
 
-> **Env-var credentials:** launchd does not see your shell environment. If
-> your config resolves credentials from env vars (backend `bws` with
-> `credentials: env`, or Vaultwarden `credentials: env`), the background agent
-> cannot read them — either run `tapwarden start --fg` from a shell that
-> exports them, switch to `credentials: keychain` (`tapwarden store-token` for
-> BWS, `tapwarden setup` for Vaultwarden), or add an `EnvironmentVariables`
-> dict to `~/Library/LaunchAgents/com.tapwarden.agent.plist` yourself.
+> **Env-var credentials:** launchd does not see your shell environment, so
+> `tapwarden start` refuses a config that resolves credentials from env vars
+> (`credentials: env`, the default). Either run `tapwarden start --fg` from a
+> shell that exports them, or switch to `credentials: keychain`
+> (`tapwarden store-token` for BWS, `tapwarden setup` for Vaultwarden).
 
 ### Code signing (optional, recommended)
 
@@ -287,9 +301,9 @@ cargo test touch_id_prompt_manual -- --ignored --nocapture
   and is future work.
 - Private keys, tokens, and the master password exist in memory only; error
   messages and logs never contain secret material or server response bodies.
-- The agent socket lives in a per-user 0700 directory (`$XDG_RUNTIME_DIR/tapwarden`
-  or a uid-suffixed temp dir), validated against symlink planting; umask is
-  tightened before bind.
+- The agent socket lives in a per-user 0700 directory
+  (`~/Library/Application Support/tapwarden`, not the temp dir macOS purges),
+  validated against symlink planting; umask is tightened before bind.
 - Backend crypto (EncString AES-256-CBC + HMAC-SHA256, KDF derivation) mirrors
   the official Bitwarden SDK source and is tested against the SDK's published
   vectors; MACs are verified in constant time **before** decryption.

@@ -277,7 +277,7 @@ fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -
     println!();
     println!("Point SSH at it permanently — add to ~/.ssh/config:");
     println!("  Host *");
-    println!("    IdentityAgent {}", socket.display());
+    println!("    {}", runtime_paths::identity_agent_line(&socket));
     println!();
     println!("Logs: `tapwarden logs` — stop: `tapwarden stop` — remove: `tapwarden uninstall`");
     Ok(())

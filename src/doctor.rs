@@ -315,34 +315,69 @@ fn check_ssh_wiring(r: &mut Report) {
     let Ok(socket) = runtime_paths::socket_path() else {
         return;
     };
-    report_ssh_wiring(r, &socket, std::env::var_os("SSH_AUTH_SOCK"));
+    report_ssh_wiring(
+        r,
+        &socket,
+        ssh_identity_agent(),
+        std::env::var_os("SSH_AUTH_SOCK"),
+    );
 }
 
-fn report_ssh_wiring(r: &mut Report, socket: &Path, current: Option<std::ffi::OsString>) {
-    match current {
+/// The `IdentityAgent` ssh would use, as `ssh -G` resolves it from the user's
+/// config (tilde expanded). Read-only: `-G` prints the config and exits.
+fn ssh_identity_agent() -> Option<String> {
+    let out = std::process::Command::new("ssh")
+        .args(["-G", "tapwarden-doctor-probe"])
+        .output()
+        .ok()?;
+    parse_identity_agent(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_identity_agent(ssh_g_output: &str) -> Option<String> {
+    ssh_g_output
+        .lines()
+        .find_map(|line| line.strip_prefix("identityagent "))
+        .map(str::to_string)
+}
+
+/// Which agent ssh will talk to: `IdentityAgent` wins over `SSH_AUTH_SOCK`,
+/// except for its two keywords (`SSH_AUTH_SOCK` defers to the env, `none`
+/// disables agents).
+fn report_ssh_wiring(
+    r: &mut Report,
+    socket: &Path,
+    identity_agent: Option<String>,
+    ssh_auth_sock: Option<std::ffi::OsString>,
+) {
+    let (via, effective) = match identity_agent.as_deref() {
+        None | Some("SSH_AUTH_SOCK") => ("SSH_AUTH_SOCK", ssh_auth_sock),
+        Some("none") => ("IdentityAgent", None),
+        Some(path) => ("IdentityAgent", Some(path.into())),
+    };
+    match effective {
         Some(val) if Path::new(&val) == socket => {
             r.line(
                 Status::Ok,
-                "ssh_auth_sock",
-                "points at the tapwarden socket",
+                "ssh_wiring",
+                &format!("{via} points at the tapwarden socket"),
             );
         }
         Some(_) => {
             r.line(
                 Status::Warn,
-                "ssh_auth_sock",
-                "set, but not to the tapwarden socket",
+                "ssh_wiring",
+                &format!("{via} points at another agent"),
             );
             r.hint(&format!(
-                "set `IdentityAgent {}` under `Host *` in ~/.ssh/config",
-                socket.display()
+                "set `{}` under `Host *` in ~/.ssh/config",
+                runtime_paths::identity_agent_line(socket)
             ));
         }
         None => {
-            r.line(Status::Warn, "ssh_auth_sock", "not set in this shell");
+            r.line(Status::Warn, "ssh_wiring", "ssh has no agent configured");
             r.hint(&format!(
-                "set `IdentityAgent {}` under `Host *` in ~/.ssh/config",
-                socket.display()
+                "set `{}` under `Host *` in ~/.ssh/config",
+                runtime_paths::identity_agent_line(socket)
             ));
         }
     }
@@ -614,16 +649,87 @@ mod tests {
         let socket = Path::new("/tmp/tapwarden-test/agent.sock");
 
         let mut r = Report::new();
-        report_ssh_wiring(&mut r, socket, Some(socket.as_os_str().to_os_string()));
+        report_ssh_wiring(
+            &mut r,
+            socket,
+            None,
+            Some(socket.as_os_str().to_os_string()),
+        );
         assert_eq!((r.fails, r.warns), (0, 0), "a matching socket is ok");
 
         let mut r = Report::new();
-        report_ssh_wiring(&mut r, socket, Some("/tmp/other-agent.sock".into()));
+        report_ssh_wiring(&mut r, socket, None, Some("/tmp/other-agent.sock".into()));
         assert_eq!((r.fails, r.warns), (0, 1), "another agent is a warning");
 
         let mut r = Report::new();
-        report_ssh_wiring(&mut r, socket, None);
+        report_ssh_wiring(&mut r, socket, None, None);
         assert_eq!((r.fails, r.warns), (0, 1), "unset is a warning");
+    }
+
+    /// The README wires ssh with `IdentityAgent`, and macOS always points
+    /// SSH_AUTH_SOCK at its own launchd agent — so a correctly set up Mac must
+    /// pass on IdentityAgent alone, whatever SSH_AUTH_SOCK says.
+    #[test]
+    fn identity_agent_wiring_wins_over_ssh_auth_sock() {
+        let socket = Path::new("/Users/z/Library/Application Support/tapwarden/agent.sock");
+        let launchd = Some("/private/tmp/com.apple.launchd.x/Listeners".into());
+
+        let mut r = Report::new();
+        report_ssh_wiring(
+            &mut r,
+            socket,
+            Some(socket.display().to_string()),
+            launchd.clone(),
+        );
+        assert_eq!(
+            (r.fails, r.warns),
+            (0, 0),
+            "IdentityAgent at tapwarden is ok"
+        );
+
+        let mut r = Report::new();
+        report_ssh_wiring(
+            &mut r,
+            socket,
+            Some("/elsewhere.sock".into()),
+            Some(socket.into()),
+        );
+        assert_eq!(
+            (r.fails, r.warns),
+            (0, 1),
+            "IdentityAgent elsewhere overrides the env"
+        );
+
+        let mut r = Report::new();
+        report_ssh_wiring(
+            &mut r,
+            socket,
+            Some("SSH_AUTH_SOCK".into()),
+            Some(socket.into()),
+        );
+        assert_eq!(
+            (r.fails, r.warns),
+            (0, 0),
+            "IdentityAgent SSH_AUTH_SOCK defers to the env"
+        );
+
+        let mut r = Report::new();
+        report_ssh_wiring(&mut r, socket, Some("none".into()), Some(socket.into()));
+        assert_eq!(
+            (r.fails, r.warns),
+            (0, 1),
+            "IdentityAgent none disables the agent"
+        );
+    }
+
+    #[test]
+    fn identity_agent_is_read_from_ssh_g_output() {
+        let out = "user z\nidentityagent /Users/z/Library/Application Support/tapwarden/agent.sock\nport 22\n";
+        assert_eq!(
+            parse_identity_agent(out).as_deref(),
+            Some("/Users/z/Library/Application Support/tapwarden/agent.sock")
+        );
+        assert_eq!(parse_identity_agent("user z\nport 22\n"), None);
     }
 
     #[test]

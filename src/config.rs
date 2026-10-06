@@ -263,8 +263,14 @@ impl Config {
                 "no secret_ids configured (set them in the config file or via TAPWARDEN_SECRET_IDS)"
             );
         }
-        if self.backend == Backend::Vaultwarden && self.vaultwarden.is_none() {
-            bail!("backend is vaultwarden but the `vaultwarden` config section is missing");
+        for id in &self.secret_ids {
+            uuid::Uuid::parse_str(id).with_context(|| format!("secret id `{id}` is not a UUID"))?;
+        }
+        if self.backend == Backend::Vaultwarden {
+            let vw = self.vaultwarden.as_ref().context(
+                "backend is vaultwarden but the `vaultwarden` config section is missing",
+            )?;
+            crate::vaultwarden::validate_server_url(&vw.server_url)?;
         }
         if self.backend == Backend::Bws {
             crate::secret_source::validate_bws_server_endpoint(self.server_endpoint.as_deref())?;
@@ -315,6 +321,32 @@ pub fn resolved_path(explicit: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `start` loads the config precisely so a broken one fails in the shell
+    /// instead of crash-looping under launchd. Both of these used to pass
+    /// `validate()` and only fail inside the agent.
+    #[test]
+    fn validation_catches_what_the_agent_would_die_on() {
+        let not_a_uuid: Config = serde_yaml::from_str("secret_ids: [my-deploy-key]\n").unwrap();
+        let err = format!(
+            "{:#}",
+            not_a_uuid.validate().expect_err("a name is not a UUID")
+        );
+        assert!(
+            err.contains("my-deploy-key") && err.contains("UUID"),
+            "{err}"
+        );
+
+        let no_scheme: Config = serde_yaml::from_str(
+            "secret_ids: [00000000-0000-0000-0000-000000000000]\nbackend: vaultwarden\nvaultwarden:\n  server_url: vault.example.com\n  email: e@example.com\n  credentials: keychain\n",
+        )
+        .unwrap();
+        let err = format!(
+            "{:#}",
+            no_scheme.validate().expect_err("a bare host is not a URL")
+        );
+        assert!(err.contains("server_url"), "{err}");
+    }
 
     const MINIMAL_YAML: &str = "secret_ids: [00000000-0000-0000-0000-000000000000]\n";
 

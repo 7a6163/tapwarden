@@ -16,10 +16,33 @@ use crate::authorizer::{AuthContext, Authorizer};
 use crate::keychain;
 
 /// Bound every backend request: a stalled connection must never wedge the
-/// agent (the key cache mutex is held across fetches, so an unbounded request
-/// would block all signing and identity listing forever).
+/// agent. Each fetcher holds its own session mutex across the request, and a
+/// loading pass holds the agent's loading lock, so an unbounded request would
+/// block every identity listing (and every sign with a not-yet-loaded key)
+/// forever.
 // ponytail: fixed timeouts; make configurable if a slow self-hosted server appears.
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// After a failed backend login (offline, server down, unlock prompt denied),
+/// how long both fetchers fail fast before trying — and prompting — again.
+/// Every `ssh` lists keys first, so without it each one raises a prompt that
+/// cannot succeed, once per configured key.
+pub(crate) const LOGIN_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// The fail-fast error while a failed login's backoff is still running.
+/// Static on purpose: it carries no server output.
+pub(crate) fn check_login_backoff(
+    failed_at: Option<std::time::Instant>,
+    backoff: Duration,
+) -> Result<()> {
+    let wait = failed_at.map_or(Duration::ZERO, |at| backoff.saturating_sub(at.elapsed()));
+    if !wait.is_zero() {
+        bail!(
+            "the last backend login failed; retrying in {}s",
+            wait.as_secs().max(1)
+        );
+    }
+    Ok(())
+}
 const HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Shared backend HTTP client: bounded timeouts, and redirects are never
@@ -260,12 +283,11 @@ pub struct BwsRest {
     /// `Grace` never applies its window to `AuthContext::UnlockCredentials`,
     /// so a keychain read always prompts.
     gate: Arc<dyn Authorizer>,
-    /// Lazily-established session, shared across `get` calls. The parsed
-    /// access token lives only in `Pending` and is dropped from memory on the
-    /// first successful authenticate.
-    // ponytail: bearer expiry ignored — the agent fetches each secret once and
-    // caches it in memory; add re-auth on HTTP 401 if long-lived refetch appears.
+    /// Lazily-established session, shared across `get` calls, renewed when
+    /// the server answers 401 (the bearer expires after about an hour).
     state: tokio::sync::Mutex<AuthState>,
+    /// `LOGIN_RETRY_BACKOFF`; a field so tests need not wait it out.
+    login_backoff: Duration,
 }
 
 /// Where the BWS access token comes from, resolved on the first fetch.
@@ -282,16 +304,19 @@ pub(crate) fn validate_access_token(token: &str) -> Result<()> {
     AccessToken::parse(token).map(|_| ())
 }
 
-enum AuthState {
-    /// Held until the first successful login; a failed attempt (or a denied
-    /// keychain unlock) leaves it in place so a later `get` can retry.
-    Pending(PendingToken),
-    Ready(Session),
+/// Where to log in from, plus the current session if there is one.
+struct AuthState {
+    source: TokenSource,
+    session: Option<Session>,
+    /// When the last login failed, for `LOGIN_RETRY_BACKOFF`.
+    failed_at: Option<std::time::Instant>,
 }
 
-/// An env token is parsed at construction (fail fast); a keychain token is
-/// read and parsed lazily inside the gated first fetch.
-enum PendingToken {
+/// An env token is parsed at construction (fail fast) and kept so an expired
+/// session can be renewed. Keeping it adds no exposure: the same token stays
+/// in the process environment for the agent's whole life anyway. A keychain
+/// token is never kept — each login re-reads it behind the presence gate.
+enum TokenSource {
     Parsed(AccessToken),
     Keychain,
 }
@@ -366,15 +391,20 @@ impl BwsRest {
     ) -> Result<Self> {
         let (identity_url, api_url) = service_urls(server_endpoint)?;
         let pending = match credentials {
-            BwsCredentials::Env(token) => PendingToken::Parsed(AccessToken::parse(&token)?),
-            BwsCredentials::Keychain => PendingToken::Keychain,
+            BwsCredentials::Env(token) => TokenSource::Parsed(AccessToken::parse(&token)?),
+            BwsCredentials::Keychain => TokenSource::Keychain,
         };
         Ok(Self {
             identity_url,
             api_url,
             http: http_client()?,
             gate,
-            state: tokio::sync::Mutex::new(AuthState::Pending(pending)),
+            state: tokio::sync::Mutex::new(AuthState {
+                source: pending,
+                session: None,
+                failed_at: None,
+            }),
+            login_backoff: LOGIN_RETRY_BACKOFF,
         })
     }
 
@@ -456,29 +486,55 @@ impl BwsRest {
 impl SecretFetcher for BwsRest {
     async fn get(&self, id: Uuid) -> Result<SecretData> {
         let mut state = self.state.lock().await;
-        if let AuthState::Pending(pending) = &*state {
-            let session = match pending {
-                PendingToken::Parsed(token) => self.authenticate(token).await?,
-                PendingToken::Keychain => {
-                    let token = self.resolve_keychain_token().await?;
-                    self.authenticate(&token).await?
+        // At most two attempts: the second runs only after a 401, on a fresh
+        // login. Bounded by the range, so no change to the condition below can
+        // turn it into an endless loop.
+        let mut response = None;
+        for attempt in 0..2 {
+            if state.session.is_none() {
+                check_login_backoff(state.failed_at, self.login_backoff)?;
+                let login = match &state.source {
+                    TokenSource::Parsed(token) => self.authenticate(token).await,
+                    TokenSource::Keychain => match self.resolve_keychain_token().await {
+                        Ok(token) => self.authenticate(&token).await,
+                        Err(e) => Err(e),
+                    },
+                };
+                match login {
+                    Ok(session) => {
+                        state.session = Some(session);
+                        state.failed_at = None;
+                    }
+                    Err(e) => {
+                        state.failed_at = Some(std::time::Instant::now());
+                        return Err(e);
+                    }
                 }
+            }
+            let Some(session) = &state.session else {
+                bail!("no session established");
             };
-            // Success: replacing the state drops the access token from memory.
-            *state = AuthState::Ready(session);
+            let fetched = self
+                .http
+                .get(format!("{}/secrets/{}", self.api_url, id))
+                .bearer_auth(&session.bearer)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .await
+                .context("secret fetch failed: request error")?;
+            if fetched.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                state.session = None;
+                continue;
+            }
+            response = Some(fetched);
+            break;
         }
-        let AuthState::Ready(session) = &*state else {
-            bail!("access token already consumed but no session established");
+        let Some(response) = response else {
+            bail!("no session established");
         };
-
-        let response = self
-            .http
-            .get(format!("{}/secrets/{}", self.api_url, id))
-            .bearer_auth(&session.bearer)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .context("secret fetch failed: request error")?;
+        let Some(session) = &state.session else {
+            bail!("no session established");
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -784,6 +840,89 @@ mod tests {
 
         // The session is cached: a second fetch must not re-authenticate.
         assert_eq!(fetcher.get(id).await.unwrap().name, "deploy-key");
+        assert_eq!(
+            server.hits("/identity/connect/token"),
+            1,
+            "one login, reused"
+        );
+    }
+
+    /// Counts prompts; always says no.
+    struct DenyingGate(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Authorizer for DenyingGate {
+        async fn approve(&self, _ctx: &AuthContext<'_>) -> Result<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(false)
+        }
+    }
+
+    /// Listing keys is the first thing every `ssh` does. When the login
+    /// cannot succeed (offline, prompt dismissed), each one used to raise a
+    /// fresh Touch ID prompt — and one per configured key. After a failure
+    /// the fetcher waits out a short backoff before prompting again.
+    #[tokio::test]
+    async fn a_failed_login_is_not_retried_until_the_backoff_passes() {
+        let gate = Arc::new(DenyingGate(Default::default()));
+        let mut fetcher = BwsRest::new(BwsCredentials::Keychain, None, gate.clone()).unwrap();
+        fetcher.login_backoff = Duration::from_millis(200);
+        let prompts = || gate.0.load(std::sync::atomic::Ordering::SeqCst);
+
+        err_of(fetcher.get(Uuid::from_u128(1)).await);
+        assert_eq!(prompts(), 1);
+        let err = err_of(fetcher.get(Uuid::from_u128(2)).await);
+        assert_eq!(
+            prompts(),
+            1,
+            "a second key within the backoff must not prompt"
+        );
+        assert!(err.contains("retrying"), "{err}");
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        err_of(fetcher.get(Uuid::from_u128(1)).await);
+        assert_eq!(prompts(), 2, "after the backoff the login is tried again");
+    }
+
+    /// The bearer expires after about an hour, and a key whose first fetch
+    /// failed is retried later. A 401 on the fetch must re-authenticate and
+    /// retry once instead of failing until the agent restarts.
+    #[tokio::test]
+    async fn an_expired_bearer_is_renewed_on_401() {
+        let id = Uuid::from_u128(7);
+        let secret_path = format!("/api/secrets/{id}");
+        let mut routes = vec![(secret_path.clone(), 401, "{}".to_string())];
+        routes.extend(bws_stub_routes(id, "deploy-key", "PRIVATE-KEY-MATERIAL"));
+        let server = crate::test_support::StubServer::start(routes).await;
+        let fetcher = stub_fetcher(&server.base_url);
+
+        let secret = fetcher
+            .get(id)
+            .await
+            .expect("a renewed session must fetch the secret");
+        assert_eq!(secret.name, "deploy-key");
+        assert_eq!(
+            server.hits("/identity/connect/token"),
+            2,
+            "401 must re-authenticate"
+        );
+        assert_eq!(server.hits(&secret_path), 2, "and retry the fetch once");
+    }
+
+    /// A 401 that survives a fresh login is a real authorization failure,
+    /// not an expired bearer: report it, do not loop.
+    #[tokio::test]
+    async fn a_401_after_renewal_is_reported_not_retried_forever() {
+        let id = Uuid::from_u128(7);
+        let secret_path = format!("/api/secrets/{id}");
+        let mut routes = vec![(secret_path.clone(), 401, "{}".to_string())];
+        routes.extend(bws_stub_routes(id, "deploy-key", "k"));
+        routes.retain(|(path, status, _)| path != &secret_path || *status == 401);
+        let server = crate::test_support::StubServer::start(routes).await;
+
+        let err = err_of(stub_fetcher(&server.base_url).get(id).await);
+        assert!(err.contains("401"), "{err}");
+        assert_eq!(server.hits(&secret_path), 2);
     }
 
     #[tokio::test]

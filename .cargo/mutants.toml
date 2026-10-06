@@ -23,6 +23,8 @@ exclude_re = [
     # booting out the user's actual agent.
     "src/daemon\\.rs:.*\\b(launchctl|home|start|stop|uninstall|logs|is_loaded)\\b",
     "src/agent\\.rs:.*\\brun_foreground\\b",
+    # Runs the real `ssh -G`; the parsing and judging it feeds are tested.
+    "src/doctor\\.rs:.*\\bssh_identity_agent\\b",
     # Wizard entry points: they read stdin and the terminal password prompt.
     "src/setup\\.rs:.*\\b(run|store_bws_token|prompt)\\b",
 ]
