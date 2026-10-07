@@ -1,5 +1,7 @@
 # tapwarden
 
+![tapwarden — a Touch ID gated SSH agent for Bitwarden](docs/banner.webp)
+
 [![codecov](https://codecov.io/gh/7a6163/tapwarden/graph/badge.svg)](https://codecov.io/gh/7a6163/tapwarden)
 
 An SSH agent that serves keys from **Bitwarden Secrets Manager** or a
@@ -13,7 +15,7 @@ self-reviewed (no third-party audit yet); the BWS access token and Vaultwarden c
 the macOS Keychain behind Touch ID; a YubiKey/FIDO2 touch works as an
 alternative presence factor; runs in the background as a LaunchAgent
 (`start`/`stop`/`logs`/`uninstall`), with a `doctor` diagnostics command.
-Roadmap: Developer ID signing + notarization, Homebrew packaging, Linux support.
+Roadmap: Developer ID signing + notarization, Linux support.
 
 ## Why
 
@@ -43,7 +45,8 @@ Private keys exist in memory only. Nothing is ever written to disk or logged.
 - One of the two backends below
 
 ```sh
-cargo install tapwarden    # from crates.io → ~/.cargo/bin/tapwarden
+brew install 7a6163/tap/tapwarden   # Homebrew
+cargo install tapwarden             # or from crates.io → ~/.cargo/bin/tapwarden
 ```
 
 Or from a checkout: `cargo build --release` → `target/release/tapwarden`.

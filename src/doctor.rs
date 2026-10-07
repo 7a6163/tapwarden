@@ -67,9 +67,18 @@ impl Report {
     }
 }
 
+/// `tapwarden doctor <version> (<binary>)`: which build produced this report.
+fn header_line(exe: Option<&Path>) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match exe {
+        Some(exe) => format!("tapwarden doctor {version} ({})", exe.display()),
+        None => format!("tapwarden doctor {version}"),
+    }
+}
+
 pub async fn run(config_path: Option<&str>, check_backend: bool) -> Result<()> {
     let mut r = Report::new();
-    println!("tapwarden doctor\n");
+    println!("{}\n", header_line(std::env::current_exe().ok().as_deref()));
 
     let cfg = check_config(&mut r, config_path);
     if let Some(cfg) = cfg.as_ref() {
@@ -414,6 +423,25 @@ async fn check_backend_keys(r: &mut Report, cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnostics from a stale install look plausible and are wrong. The
+    /// header names the version and the binary that produced them, so an old
+    /// copy earlier on PATH is visible at a glance.
+    #[test]
+    fn the_header_names_the_version_and_the_binary() {
+        let header = header_line(Some(Path::new("/Users/z/.cargo/bin/tapwarden")));
+        assert_eq!(
+            header,
+            format!(
+                "tapwarden doctor {} (/Users/z/.cargo/bin/tapwarden)",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            header_line(None),
+            format!("tapwarden doctor {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
     use crate::secret_source::bws_stub_routes;
     use crate::test_support::{StubServer, TEST_ED25519_KEY, TmpDir};
     use uuid::Uuid;

@@ -9,6 +9,7 @@ repository = "https://github.com/7a6163/tapwarden"
 readme = "README.md"
 keywords = ["ssh", "ssh-agent", "bitwarden", "vaultwarden", "touch-id"]
 categories = ["command-line-utilities", "authentication", "cryptography"]
+exclude = ["docs/"] # README images; crates.io resolves them from the repository
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
