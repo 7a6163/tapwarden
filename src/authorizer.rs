@@ -15,6 +15,9 @@ pub enum AuthContext<'a> {
         key_comment: &'a str,
         /// Stable SHA-256 public-key fingerprint used to scope grace windows.
         key_fingerprint: &'a str,
+        /// The process on the other end of the connection (`peer::describe`),
+        /// or `None` when the kernel would not say. Shown, never trusted.
+        requester: Option<&'a str>,
     },
     /// Reading stored backend credentials (e.g. from the macOS Keychain).
     UnlockCredentials { reason: &'a str },
@@ -89,6 +92,23 @@ fn await_verdict(
     }
 }
 
+/// The prompt reads "tapwarden is trying to <reason>" on macOS. Only the key
+/// comment and the requesting process go in — never key material or the data
+/// to sign.
+fn prompt_reason(ctx: &AuthContext<'_>) -> String {
+    match ctx {
+        AuthContext::Sign {
+            key_comment,
+            requester,
+            ..
+        } => format!(
+            "sign an SSH request with key \"{key_comment}\" for {}",
+            requester.unwrap_or("an unidentified process")
+        ),
+        AuthContext::UnlockCredentials { reason } => reason.to_string(),
+    }
+}
+
 #[async_trait]
 impl Authorizer for Biometric {
     async fn approve(&self, ctx: &AuthContext<'_>) -> Result<bool> {
@@ -96,14 +116,7 @@ impl Authorizer for Biometric {
             AndroidText, BiometricStrength, Context, PolicyBuilder, Text, WindowsText,
         };
 
-        // Prompt reads "tapwarden is trying to <reason>" on macOS.
-        // Only the key comment goes in — never key material or the data to sign.
-        let reason = match ctx {
-            AuthContext::Sign { key_comment, .. } => {
-                format!("sign an SSH request with key \"{key_comment}\"")
-            }
-            AuthContext::UnlockCredentials { reason } => reason.to_string(),
-        };
+        let reason = prompt_reason(ctx);
 
         // `authenticate` only *raises* the prompt: the verdict arrives later on
         // a framework queue, so block a worker thread on the reply rather than
@@ -437,10 +450,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_prompt_names_the_key_and_the_requester() {
+        let sign = |requester| AuthContext::Sign {
+            key_comment: "work@laptop",
+            key_fingerprint: "SHA256:key-a",
+            requester,
+        };
+        assert_eq!(
+            prompt_reason(&sign(Some("/usr/bin/ssh (pid 812)"))),
+            "sign an SSH request with key \"work@laptop\" for /usr/bin/ssh (pid 812)"
+        );
+        assert_eq!(
+            prompt_reason(&sign(None)),
+            "sign an SSH request with key \"work@laptop\" for an unidentified process"
+        );
+        assert_eq!(
+            prompt_reason(&AuthContext::UnlockCredentials {
+                reason: "unlock the backend credentials"
+            }),
+            "unlock the backend credentials"
+        );
+    }
+
     fn ctx() -> AuthContext<'static> {
         AuthContext::Sign {
             key_comment: "test@key",
             key_fingerprint: "SHA256:key-a",
+            requester: None,
         }
     }
 
@@ -499,6 +536,7 @@ mod tests {
         let other = AuthContext::Sign {
             key_comment: "test@key",
             key_fingerprint: "SHA256:key-b",
+            requester: None,
         };
         assert!(grace.approve(&other).await.unwrap());
         assert_eq!(
@@ -605,6 +643,7 @@ mod tests {
             .approve(&AuthContext::Sign {
                 key_comment: "m0-poc@tapwarden",
                 key_fingerprint: "SHA256:m0-poc",
+                requester: Some("the touch_id_prompt_manual test"),
             })
             .await;
         println!("Biometric::approve returned: {result:?}");

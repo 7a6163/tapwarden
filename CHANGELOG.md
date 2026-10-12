@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The Touch ID prompt names the process asking for the signature and the one
+  that started it, e.g. `for /usr/bin/ssh (pid 812), started by
+  /opt/homebrew/bin/git (pid 790)`, so a request you did not start reads
+  differently from your own `ssh` or `git commit`. The name comes from the
+  socket's peer credentials and is advisory: a same-uid process can name its
+  binary anything.
+- Every signature verdict (approved, denied, failed) is written to the agent
+  log with the key comment and the requesting process — the only record of
+  who asked when the factor is a YubiKey.
+
 ## [0.3.1] - 2026-10-08
 
 ### Added

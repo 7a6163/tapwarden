@@ -7,6 +7,7 @@ mod config;
 mod daemon;
 mod doctor;
 mod keychain;
+mod peer;
 mod runtime_paths;
 mod secret_source;
 mod setup;

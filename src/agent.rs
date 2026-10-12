@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use signature::Signer as _;
-use ssh_agent_lib::agent::{Session, listen};
+use ssh_agent_lib::agent::{Agent, Session, listen};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, PublicCredential, SignRequest};
 use ssh_key::{Algorithm, HashAlg, PrivateKey, Signature};
@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 use crate::authorizer::{AuthContext, Authorizer, Biometric, Grace, YubikeyTouch};
 use crate::config::{AuthFactor, AuthMode, Backend, Config, CredentialSource};
-use crate::runtime_paths;
 use crate::secret_source::{BwsCredentials, BwsRest, SecretData, SecretFetcher};
 use crate::vaultwarden::{VaultwardenFetcher, VwCredentials};
+use crate::{peer, runtime_paths};
 
 struct LoadedKey {
     key: PrivateKey,
@@ -192,7 +192,13 @@ impl KeyService {
             .collect()
     }
 
-    async fn sign(&self, request: SignRequest) -> Result<Signature, AgentError> {
+    /// `requester` describes the connected process (`peer::describe`). It is
+    /// shown in the prompt and the log, never used to decide anything.
+    async fn sign(
+        &self,
+        request: SignRequest,
+        requester: Option<&str>,
+    ) -> Result<Signature, AgentError> {
         // The key is cloned out and the lock dropped before the prompt, so a
         // pending Touch ID prompt never blocks other clients.
         let (key, comment, fingerprint) =
@@ -203,12 +209,21 @@ impl KeyService {
         let ctx = AuthContext::Sign {
             key_comment: &comment,
             key_fingerprint: &fingerprint,
+            requester,
         };
-        let approved = self
-            .authorizer
-            .approve(&ctx)
-            .await
-            .map_err(|e| AgentError::Other(e.into()))?;
+        let verdict = self.authorizer.approve(&ctx).await;
+        // An audit trail of who asked, for both factors — a YubiKey touch has
+        // no prompt text to show it in. The key comment and the process only.
+        let outcome = match &verdict {
+            Ok(true) => "approved",
+            Ok(false) => "denied",
+            Err(_) => "failed",
+        };
+        (self.log)(&format!(
+            "tapwarden: signature with key \"{comment}\" for {}: {outcome}",
+            requester.unwrap_or("an unidentified process")
+        ));
+        let approved = verdict.map_err(|e| AgentError::Other(e.into()))?;
         if !approved {
             return Err(AgentError::Failure); // SSH_AGENT_FAILURE; key untouched
         }
@@ -218,18 +233,40 @@ impl KeyService {
 }
 
 /// One session per client connection; all sessions share the `KeyService`.
-#[derive(Clone)]
-struct TapwardenSession(Arc<KeyService>);
+struct TapwardenSession {
+    service: Arc<KeyService>,
+    /// Who connected, looked up once when the connection is accepted.
+    requester: Option<String>,
+}
 
 #[ssh_agent_lib::async_trait]
 impl Session for TapwardenSession {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        Ok(self.0.identities().await)
+        Ok(self.service.identities().await)
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        self.0.sign(request).await
+        self.service.sign(request, self.requester.as_deref()).await
     }
+}
+
+/// Hands each accepted connection a session that knows its peer.
+struct TapwardenAgent(Arc<KeyService>);
+
+impl Agent<UnixListener> for TapwardenAgent {
+    fn new_session(&mut self, socket: &UnixStream) -> impl Session {
+        TapwardenSession {
+            service: self.0.clone(),
+            requester: requester(socket),
+        }
+    }
+}
+
+/// The connected process, via the kernel's peer credentials. Looked up at
+/// accept time: the closer to the connect, the less room for pid reuse.
+fn requester(socket: &UnixStream) -> Option<String> {
+    let pid = socket.peer_cred().ok()?.pid()?;
+    Some(peer::describe(pid))
 }
 
 /// Backend selection. Env-sourced secrets are resolved here, at use time, and
@@ -330,7 +367,7 @@ async fn serve(config: Config, socket: std::path::PathBuf) -> Result<()> {
     println!("{}", runtime_paths::export_line(&socket));
 
     let result = tokio::select! {
-        r = listen(listener, TapwardenSession(service)) => {
+        r = listen(listener, TapwardenAgent(service)) => {
             r.context("agent listener failed")
         }
         _ = shutdown_signal() => Ok(()),
@@ -547,7 +584,7 @@ authorization:
     async fn sign_approved_produces_signature() {
         let (service, calls, request) = service_with(true);
         let sig = service
-            .sign(request)
+            .sign(request, None)
             .await
             .expect("approved sign must succeed");
         assert_eq!(sig.algorithm(), Algorithm::Ed25519);
@@ -558,7 +595,7 @@ authorization:
     async fn sign_denied_returns_failure_without_signing() {
         let (service, calls, request) = service_with(false);
         let err = service
-            .sign(request)
+            .sign(request, None)
             .await
             .expect_err("denied sign must fail");
         assert!(
@@ -575,8 +612,8 @@ authorization:
     #[tokio::test]
     async fn per_use_prompts_on_every_sign() {
         let (service, calls, request) = service_with(true);
-        service.sign(request.clone()).await.unwrap();
-        service.sign(request).await.unwrap();
+        service.sign(request.clone(), None).await.unwrap();
+        service.sign(request, None).await.unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -594,8 +631,8 @@ authorization:
         let grace = Arc::new(Grace::new(inner, Duration::from_secs(3600)));
         let (service, request) = service_with_authorizer(grace);
 
-        service.sign(request.clone()).await.unwrap();
-        service.sign(request).await.unwrap();
+        service.sign(request.clone(), None).await.unwrap();
+        service.sign(request, None).await.unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -618,7 +655,8 @@ authorization:
     #[tokio::test]
     async fn the_session_delegates_both_protocol_calls_to_the_key_service() {
         let (service, calls, request) = service_with(true);
-        let mut session = TapwardenSession(Arc::new(service));
+        let (stream, _client) = UnixStream::pair().unwrap();
+        let mut session = TapwardenAgent(Arc::new(service)).new_session(&stream);
 
         let ids = session
             .request_identities()
@@ -636,6 +674,100 @@ authorization:
             1,
             "signing must pass the authorizer"
         );
+    }
+
+    /// Records the requester each approval was asked for.
+    struct Recording {
+        allow: bool,
+        requesters: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl Authorizer for Recording {
+        async fn approve(&self, ctx: &AuthContext<'_>) -> Result<bool> {
+            let AuthContext::Sign { requester, .. } = ctx else {
+                panic!("a signature must ask about a signature");
+            };
+            let requester = requester.map(str::to_string);
+            self.requesters.lock().unwrap().push(requester);
+            Ok(self.allow)
+        }
+    }
+
+    /// The prompt can only name the requester if the session hands it to the
+    /// authorizer — and the session must have looked it up from the socket.
+    #[tokio::test]
+    async fn a_session_names_the_connected_process_to_the_authorizer() {
+        let requesters = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (service, request) = service_with_authorizer(Arc::new(Recording {
+            allow: true,
+            requesters: requesters.clone(),
+        }));
+        // Both ends live in this test process, so it is the peer.
+        let (stream, _client) = UnixStream::pair().unwrap();
+        let mut session = TapwardenAgent(Arc::new(service)).new_session(&stream);
+
+        session.sign(request).await.unwrap();
+
+        let expected = peer::describe(std::process::id() as libc::pid_t);
+        assert_eq!(*requesters.lock().unwrap(), [Some(expected)]);
+    }
+
+    /// Every verdict is logged with the key and the requester: the only
+    /// record of who asked when the factor is a YubiKey with no prompt text.
+    #[tokio::test]
+    async fn every_sign_verdict_is_logged_with_the_requester() {
+        for (allow, outcome) in [(true, "approved"), (false, "denied")] {
+            let (mut service, _calls, request) = service_with(allow);
+            let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            service.log = Box::new({
+                let lines = lines.clone();
+                move |line: &str| lines.lock().unwrap().push(line.to_string())
+            });
+
+            let _ = service
+                .sign(request.clone(), Some("/usr/bin/ssh (pid 812)"))
+                .await;
+            let _ = service.sign(request, None).await;
+
+            assert_eq!(
+                *lines.lock().unwrap(),
+                [
+                    format!(
+                        "tapwarden: signature with key \"unit-test@tapwarden\" for /usr/bin/ssh (pid 812): {outcome}"
+                    ),
+                    format!(
+                        "tapwarden: signature with key \"unit-test@tapwarden\" for an unidentified process: {outcome}"
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_authorizer_is_logged_as_failed() {
+        struct Broken;
+        #[async_trait]
+        impl Authorizer for Broken {
+            async fn approve(&self, _ctx: &AuthContext<'_>) -> Result<bool> {
+                Err(anyhow!("prompt never drawn"))
+            }
+        }
+        let (mut service, request) = service_with_authorizer(Arc::new(Broken));
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        service.log = Box::new({
+            let lines = lines.clone();
+            move |line: &str| lines.lock().unwrap().push(line.to_string())
+        });
+
+        let err = service
+            .sign(request, None)
+            .await
+            .expect_err("an error is not an approval");
+        assert!(matches!(err, AgentError::Other(_)), "{err:?}");
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with(": failed"), "{lines:?}");
     }
 
     #[tokio::test]
@@ -825,7 +957,7 @@ authorization:
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Client B signs with the key that is already loaded.
-        tokio::time::timeout(Duration::from_secs(1), service.sign(request))
+        tokio::time::timeout(Duration::from_secs(1), service.sign(request, None))
             .await
             .expect("a loaded key must be usable while another fetch is pending")
             .expect("the approved signature must succeed");
@@ -846,7 +978,7 @@ authorization:
             }),
         );
         let err = empty
-            .sign(request)
+            .sign(request, None)
             .await
             .expect_err("unknown key must fail");
         assert!(matches!(err, AgentError::Failure));

@@ -297,6 +297,10 @@ cargo test touch_id_prompt_manual -- --ignored --nocapture
 
 - Every `sign` passes the `Authorizer` (Touch ID) — there is no silent signing
   path, even for same-uid processes.
+- The prompt names the requesting process and its parent (from the socket's
+  peer credentials), and every verdict is logged with them. This is a hint
+  for the human, not an access check: a same-uid process can name its binary
+  anything, so approve only requests you just started.
 - With `credentials: keychain` (Vaultwarden), the backend credentials live in
   the macOS Keychain and **every read is gated by a Touch ID prompt** — a
   recent signature approval (`grace` mode) never unlocks them. An OS-level
