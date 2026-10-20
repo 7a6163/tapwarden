@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348).
+- rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349).
 
 ## [0.3.2] - 2026-10-12
 
