@@ -245,6 +245,19 @@ fn start_in(launchd: &Launchd<'_>, config: &Config, config_path: Option<&str>) -
         .to_str()
         .context("the LaunchAgent plist path is not valid UTF-8")?;
     let deadline = Instant::now() + launchd.retry_budget;
+    // bootout only starts the removal: launchd keeps listing the old service
+    // for a few milliseconds (`tapwarden stop && tapwarden start` lands right
+    // in that window). A bootstrap then fails while `print` still finds the
+    // old service, which the check below would take for the new one — and
+    // kickstart a service that is about to vanish. Let it vanish first —
+    // whoever booted it out: when `stop` already did, our own bootout fails.
+    // The budget is checked on its own, as in the loop below.
+    while launchd.is_loaded() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let out = loop {
         let out = (launchd.run)(&["bootstrap", &gui_domain(), plist_str])?;
         if out.status.success() || launchd.is_loaded() || !booted_out {
@@ -540,7 +553,8 @@ mod tests {
     fn start_writes_a_0644_plist_and_bootstraps_then_kickstarts() {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_support::TmpDir::new("daemon");
-        let fake = FakeLaunchctl::new(vec![]);
+        // The booted-out service is already gone by the first `print`.
+        let fake = FakeLaunchctl::new(vec![("print", 1)]);
         let run = |args: &[&str]| fake.respond(args);
         let launchd = fake_launchd(&dir, &run);
 
@@ -562,7 +576,7 @@ mod tests {
         assert_eq!(mode, 0o644);
         assert_eq!(
             fake.subcommands(),
-            vec!["bootout", "bootstrap", "kickstart"]
+            vec!["bootout", "print", "bootstrap", "kickstart"]
         );
     }
 
@@ -622,6 +636,87 @@ mod tests {
 
         start_in(&launchd, &minimal_config(), None).expect("the retry must ride out the race");
         assert_eq!(*attempts.borrow(), 3, "bootstrap must have been retried");
+    }
+
+    /// `tapwarden stop && tapwarden start`: the bootout returns while launchd
+    /// still lists the old service for a few milliseconds. A bootstrap in
+    /// that window fails, and `print` still finding the *old* service must not
+    /// pass for the new one being loaded — kickstarting it fails, and the
+    /// service is gone a moment later.
+    #[test]
+    fn start_waits_for_the_booted_out_service_to_disappear() {
+        use std::cell::Cell;
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![]);
+        // How many more `print`s still find the old service.
+        let lingering = Cell::new(2);
+        let bootstrapped = Cell::new(false);
+        let run = |args: &[&str]| {
+            let loaded = match args[0] {
+                "print" if lingering.get() > 0 => {
+                    lingering.set(lingering.get() - 1);
+                    true
+                }
+                "print" => bootstrapped.get(),
+                "bootstrap" if lingering.get() > 0 => false,
+                "bootstrap" => {
+                    bootstrapped.set(true);
+                    true
+                }
+                "kickstart" => bootstrapped.get(),
+                _ => return fake.respond(args),
+            };
+            fake.calls.borrow_mut().push(args[0].to_string());
+            Ok(output(if loaded { 0 } else { 5 }, ""))
+        };
+        let mut launchd = fake_launchd(&dir, &run);
+        launchd.retry_budget = Duration::from_secs(2);
+
+        start_in(&launchd, &minimal_config(), None)
+            .expect("start must wait out the old service, then load the new one");
+        assert!(bootstrapped.get(), "{:?}", fake.subcommands());
+        assert_eq!(
+            fake.subcommands(),
+            [
+                "bootout",
+                "print",
+                "print",
+                "print",
+                "bootstrap",
+                "kickstart"
+            ]
+        );
+    }
+
+    /// When `stop` already booted the service out, `start`'s own bootout
+    /// fails ("No such process") while launchd may still list the old one.
+    /// That must not skip the wait.
+    #[test]
+    fn start_waits_even_when_its_own_bootout_found_nothing() {
+        use std::cell::Cell;
+        let dir = crate::test_support::TmpDir::new("daemon");
+        let fake = FakeLaunchctl::new(vec![("bootout", 3)]);
+        let lingering = Cell::new(1);
+        let run = |args: &[&str]| {
+            if args[0] == "print" && lingering.get() > 0 {
+                lingering.set(0);
+                fake.calls.borrow_mut().push("print".to_string());
+                return Ok(output(0, ""));
+            }
+            if args[0] == "print" {
+                fake.calls.borrow_mut().push("print".to_string());
+                return Ok(output(1, ""));
+            }
+            fake.respond(args)
+        };
+        let mut launchd = fake_launchd(&dir, &run);
+        launchd.retry_budget = Duration::from_secs(2);
+
+        start_in(&launchd, &minimal_config(), None).expect("start must succeed");
+        assert_eq!(
+            fake.subcommands(),
+            ["bootout", "print", "print", "bootstrap", "kickstart"]
+        );
     }
 
     #[test]
