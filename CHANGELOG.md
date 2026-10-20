@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   booted-out service for a few milliseconds; `start` took that old service
   for the freshly loaded one. It now waits for the old one to go first.
 
+### Security
+
+- rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348).
+
 ## [0.3.2] - 2026-10-12
 
 ### Added
