@@ -2,4 +2,8 @@
 # RUSTSEC-2023-0071: rsa Marvin timing sidechannel — no fixed release exists.
 # Pulled in via ssh-agent-lib -> ssh-key (crypto feature). Accepted risk:
 # tapwarden is Ed25519-first and never RSA-first; revisit if rsa ships a fix.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0387: crypto-bigint 0.5 timing variability — fix only in 0.7.
+# Same path (ssh-key -> p256/p384/p521 -> elliptic-curve). Accepted risk:
+# tapwarden refuses non-Ed25519 keys, so no ECDSA secret ever reaches it;
+# revisit when ssh-key/ssh-agent-lib move to elliptic-curve 0.14.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
