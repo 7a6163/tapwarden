@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.11
   (RUSTSEC-2026-0381), ctutils 0.4.7 (RUSTSEC-2026-0385).
+- The agent now disables core dumps and denies debugger attach
+  (`PT_DENY_ATTACH`) at startup, so decrypted private keys cannot be read out
+  of its memory that way.
+- The decrypted OpenSSH private key text is wiped from memory once it has been
+  parsed, instead of being left in freed memory.
 
 ## [0.3.3] - 2026-10-20
 

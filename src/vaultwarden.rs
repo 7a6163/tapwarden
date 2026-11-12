@@ -205,7 +205,7 @@ fn extract_secret(cipher: CipherResponse, user_key: &SymKey) -> Result<SecretDat
             .decrypt_to_string(key)
             .context("cipher name decryption")?,
         openssh_private_key: EncString::parse(&ssh_key.private_key)?
-            .decrypt_to_string(key)
+            .decrypt_secret(key)
             .context("cipher privateKey decryption")?,
     })
 }
@@ -697,7 +697,7 @@ mod tests {
         let secret = extract_secret(cipher, &key).unwrap();
         assert_eq!(secret.name, "deploy-key");
         assert_eq!(
-            secret.openssh_private_key,
+            *secret.openssh_private_key,
             "-----BEGIN OPENSSH PRIVATE KEY-----"
         );
     }
@@ -1042,7 +1042,7 @@ mod tests {
 
         let secret = fetcher.get(id).await.expect("stub cipher must decrypt");
         assert_eq!(secret.name, "deploy-key");
-        assert_eq!(secret.openssh_private_key, "PRIVATE-KEY-MATERIAL");
+        assert_eq!(*secret.openssh_private_key, "PRIVATE-KEY-MATERIAL");
 
         // The session is cached: a second fetch must not re-authenticate.
         assert_eq!(fetcher.get(id).await.unwrap().name, "deploy-key");

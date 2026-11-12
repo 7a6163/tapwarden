@@ -11,6 +11,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::authorizer::{AuthContext, Authorizer};
 use crate::keychain;
@@ -70,7 +71,8 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 /// One secret fetched from the backend: a named OpenSSH private key.
 pub struct SecretData {
     pub name: String,
-    pub openssh_private_key: String,
+    /// Wiped on drop so the plaintext key does not linger in freed memory.
+    pub openssh_private_key: Zeroizing<String>,
 }
 
 /// Abstracts the secret backend so the agent and tests don't depend on a
@@ -167,6 +169,18 @@ impl EncString {
 
     pub(crate) fn decrypt_to_string(&self, key: &SymKey) -> Result<String> {
         String::from_utf8(self.decrypt(key)?).context("decrypted value is not valid UTF-8")
+    }
+
+    /// `decrypt_to_string` for private key material: every buffer holding the
+    /// plaintext, including one rejected as non-UTF-8, is wiped when dropped.
+    pub(crate) fn decrypt_secret(&self, key: &SymKey) -> Result<Zeroizing<String>> {
+        match String::from_utf8(self.decrypt(key)?) {
+            Ok(text) => Ok(Zeroizing::new(text)),
+            Err(e) => {
+                e.into_bytes().zeroize();
+                bail!("decrypted value is not valid UTF-8")
+            }
+        }
     }
 }
 
@@ -553,7 +567,7 @@ impl SecretFetcher for BwsRest {
                 .decrypt_to_string(&session.org_key)
                 .context("secret fetch failed: key decryption")?,
             openssh_private_key: EncString::parse(&secret.value)?
-                .decrypt_to_string(&session.org_key)
+                .decrypt_secret(&session.org_key)
                 .context("secret fetch failed: value decryption")?,
         })
     }
@@ -714,6 +728,25 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_secret_returns_the_plaintext() {
+        let key = test_key();
+        let s = make_enc_string(b"PRIVATE-KEY-MATERIAL", &key, [0x33; 16]);
+        let out = EncString::parse(&s).unwrap().decrypt_secret(&key).unwrap();
+        assert_eq!(*out, "PRIVATE-KEY-MATERIAL");
+    }
+
+    #[test]
+    fn decrypt_secret_rejects_non_utf8() {
+        let key = test_key();
+        let s = make_enc_string(&[0xff, 0xfe], &key, [0x33; 16]);
+        let err = EncString::parse(&s)
+            .unwrap()
+            .decrypt_secret(&key)
+            .unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn enc_string_rejects_malformed_input() {
         for bad in [
             "not an encstring",
@@ -836,7 +869,7 @@ mod tests {
 
         let secret = fetcher.get(id).await.expect("stub secret must decrypt");
         assert_eq!(secret.name, "deploy-key");
-        assert_eq!(secret.openssh_private_key, "PRIVATE-KEY-MATERIAL");
+        assert_eq!(*secret.openssh_private_key, "PRIVATE-KEY-MATERIAL");
 
         // The session is cached: a second fetch must not re-authenticate.
         assert_eq!(fetcher.get(id).await.unwrap().name, "deploy-key");
