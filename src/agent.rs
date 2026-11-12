@@ -340,7 +340,32 @@ pub async fn run_foreground(config: Config, socket: Option<&str>) -> Result<()> 
         }
         None => runtime_paths::socket_path()?,
     };
+    harden_process()?;
     serve(config, socket).await
+}
+
+/// The agent holds decrypted private keys in memory. Keep them out of a core
+/// dump, and stop a debugger run as the same user from attaching to read them.
+fn harden_process() -> Result<()> {
+    disable_core_dumps()?;
+    // SAFETY: PT_DENY_ATTACH takes no pointer arguments and only flags this process.
+    if unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("could not deny debugger attach");
+    }
+    Ok(())
+}
+
+/// Hard limit too, so nothing in the process can raise it back.
+fn disable_core_dumps() -> Result<()> {
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `none` is a valid rlimit that outlives the call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("could not disable core dumps");
+    }
+    Ok(())
 }
 
 /// Serve the agent protocol on `socket` until a shutdown signal. Takes the
@@ -473,7 +498,7 @@ mod tests {
                 .cloned()
                 .map(|k| SecretData {
                     name: format!("secret-{id}"),
-                    openssh_private_key: k,
+                    openssh_private_key: k.into(),
                 })
                 .ok_or_else(|| anyhow!("no such secret"))
         }
@@ -930,9 +955,26 @@ authorization:
             }
             Ok(SecretData {
                 name: format!("secret-{id}"),
-                openssh_private_key: self.key.clone(),
+                openssh_private_key: self.key.clone().into(),
             })
         }
+    }
+
+    #[test]
+    fn core_dumps_are_disabled_for_good() {
+        // Raise the soft limit first so a no-op could not pass on the macOS default of 0.
+        let some = libc::rlimit {
+            rlim_cur: 4096,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &some) };
+        disable_core_dumps().unwrap();
+        let mut now = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut now) }, 0);
+        assert_eq!((now.rlim_cur, now.rlim_max), (0, 0));
     }
 
     #[tokio::test]

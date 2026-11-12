@@ -2838,6 +2838,7 @@ dependencies = [
  "ssh-key",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
