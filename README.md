@@ -252,7 +252,10 @@ authorization:
 ```
 
 Each `ssh` signature (and every keychain credential unlock) then needs a
-physical touch of the key instead of Touch ID. Confirm the wiring with:
+physical touch of the key instead of Touch ID. A touch has no prompt of its
+own, so tapwarden takes requests one at a time and, before each touch, posts a
+notification (and a log line) naming the key and the requesting process — read
+it before you touch. Confirm the wiring with:
 
 ```sh
 tapwarden doctor             # reports whether a FIDO2 key is connected

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- With `factor: yubikey`, requests are now approved one at a time and each is
+  announced before the touch (a notification and a log line naming the key and
+  the requesting process), so a touch can be attributed to one request instead
+  of releasing whichever signature happened to be waiting.
+- The release workflow pins every action to a full commit SHA, so a moved tag
+  or branch in a third-party action cannot reach the crates.io token or the
+  release binary.
 - rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.11
   (RUSTSEC-2026-0381), ctutils 0.4.7 (RUSTSEC-2026-0385).
 - quinn-proto 0.11.19 (RUSTSEC-2026-0523, RUSTSEC-2026-0524), quinn-udp 0.5.16
