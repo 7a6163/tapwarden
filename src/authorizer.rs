@@ -166,9 +166,14 @@ pub const YUBIKEY_RP_ID: &str = "tapwarden";
 /// `register_yubikey`; the hardware only completes it after a physical touch,
 /// so every signature (and every credential unlock) needs the key present and
 /// tapped — the YubiKey analog of the Touch ID gate.
+///
+/// A touch has no prompt of its own, so approvals are taken one at a time and
+/// each is announced first: the user can tell which request a touch releases.
 pub struct YubikeyTouch {
     credential_id: Vec<u8>,
     public_key: ctap_hid_fido2::public_key::PublicKey,
+    /// Held for the whole approval: one request waits on the key at a time.
+    one_at_a_time: tokio::sync::Mutex<()>,
 }
 
 impl YubikeyTouch {
@@ -176,8 +181,35 @@ impl YubikeyTouch {
         Self {
             credential_id,
             public_key,
+            one_at_a_time: tokio::sync::Mutex::new(()),
         }
     }
+
+    /// Say what the next touch approves, in the log and as a desktop
+    /// notification. Best effort: a notification that fails to show must not
+    /// block signing. The text travels as an argument, never as script source.
+    fn announce(message: &str) {
+        eprintln!("tapwarden: {message}");
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 1 of argv) with title \"tapwarden\"",
+                "-e",
+                "end run",
+                message,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// What the announcement before a security-key touch says.
+fn touch_message(ctx: &AuthContext<'_>) -> String {
+    format!("Touch your security key to {}", prompt_reason(ctx))
 }
 
 fn yubikey_credential_matches(expected: &[u8], returned: &[u8]) -> bool {
@@ -205,11 +237,14 @@ fn yubikey_assertion_is_valid(
 
 #[async_trait]
 impl Authorizer for YubikeyTouch {
-    async fn approve(&self, _ctx: &AuthContext<'_>) -> Result<bool> {
+    async fn approve(&self, ctx: &AuthContext<'_>) -> Result<bool> {
+        let _one_at_a_time = self.one_at_a_time.lock().await;
+        let message = touch_message(ctx);
         let credential_id = self.credential_id.clone();
         let public_key = self.public_key.clone();
         // Blocking HID I/O: keep it off the async runtime, like Biometric.
         tokio::task::spawn_blocking(move || -> Result<bool> {
+            Self::announce(&message);
             use ctap_hid_fido2::{
                 Cfg, FidoKeyHidFactory, fidokey::GetAssertionArgsBuilder, verifier,
             };
@@ -470,6 +505,18 @@ mod tests {
                 reason: "unlock the backend credentials"
             }),
             "unlock the backend credentials"
+        );
+    }
+
+    #[test]
+    fn the_touch_announcement_names_what_the_touch_approves() {
+        assert_eq!(
+            touch_message(&AuthContext::Sign {
+                key_comment: "work@laptop",
+                key_fingerprint: "SHA256:key-a",
+                requester: Some("/usr/bin/ssh (pid 812)"),
+            }),
+            "Touch your security key to sign an SSH request with key \"work@laptop\" for /usr/bin/ssh (pid 812)"
         );
     }
 
