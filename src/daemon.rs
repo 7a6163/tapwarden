@@ -533,7 +533,7 @@ mod tests {
     }
 
     fn minimal_config() -> Config {
-        serde_yaml::from_str("secret_ids: [x]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: e\n  credentials: keychain\n").unwrap()
+        serde_norway::from_str("secret_ids: [x]\nbackend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: e\n  credentials: keychain\n").unwrap()
     }
 
     /// Builds a `Launchd` over a temp dir so no real plist or log is touched.
@@ -589,7 +589,7 @@ mod tests {
         let fake = FakeLaunchctl::new(vec![]);
         let run = |args: &[&str]| fake.respond(args);
         let launchd = fake_launchd(&dir, &run);
-        let env_config: Config = serde_yaml::from_str("secret_ids: [x]\n").unwrap();
+        let env_config: Config = serde_norway::from_str("secret_ids: [x]\n").unwrap();
 
         let err = format!(
             "{:#}",
@@ -960,16 +960,16 @@ mod tests {
     #[test]
     fn env_credential_configs_are_detected() {
         // bws always resolves its access token from an env var
-        let cfg: Config = serde_yaml::from_str("secret_ids: [x]\n").unwrap();
+        let cfg: Config = serde_norway::from_str("secret_ids: [x]\n").unwrap();
         assert!(uses_env_credentials(&cfg));
 
         let keychain = "secret_ids: [x]\nbackend: vaultwarden\nvaultwarden:\n  server_url: u\n  email: e\n  credentials: keychain\n";
-        let cfg: Config = serde_yaml::from_str(keychain).unwrap();
+        let cfg: Config = serde_norway::from_str(keychain).unwrap();
         assert!(!uses_env_credentials(&cfg));
 
         let env =
             "secret_ids: [x]\nbackend: vaultwarden\nvaultwarden:\n  server_url: u\n  email: e\n";
-        let cfg: Config = serde_yaml::from_str(env).unwrap();
+        let cfg: Config = serde_norway::from_str(env).unwrap();
         assert!(uses_env_credentials(&cfg));
     }
 

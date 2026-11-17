@@ -242,7 +242,7 @@ impl Config {
         let cfg: Config = if path.exists() {
             let s = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read config file: {}", path.display()))?;
-            serde_yaml::from_str(&s)
+            serde_norway::from_str(&s)
                 .with_context(|| format!("failed to parse {} as YAML", path.display()))?
         } else {
             from_env(&std::env::var("TAPWARDEN_SECRET_IDS").unwrap_or_default())
@@ -327,7 +327,7 @@ mod tests {
     /// `validate()` and only fail inside the agent.
     #[test]
     fn validation_catches_what_the_agent_would_die_on() {
-        let not_a_uuid: Config = serde_yaml::from_str("secret_ids: [my-deploy-key]\n").unwrap();
+        let not_a_uuid: Config = serde_norway::from_str("secret_ids: [my-deploy-key]\n").unwrap();
         let err = format!(
             "{:#}",
             not_a_uuid.validate().expect_err("a name is not a UUID")
@@ -337,7 +337,7 @@ mod tests {
             "{err}"
         );
 
-        let no_scheme: Config = serde_yaml::from_str(
+        let no_scheme: Config = serde_norway::from_str(
             "secret_ids: [00000000-0000-0000-0000-000000000000]\nbackend: vaultwarden\nvaultwarden:\n  server_url: vault.example.com\n  email: e@example.com\n  credentials: keychain\n",
         )
         .unwrap();
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn yubikey_factor_without_a_registered_credential_is_refused() {
         let yaml = format!("{MINIMAL_YAML}authorization:\n  factor: yubikey\n");
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let cfg: Config = serde_norway::from_str(&yaml).unwrap();
         let err = cfg
             .validate()
             .expect_err("yubikey factor with no credential must fail closed");
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn backend_defaults_to_bws() {
-        let cfg: Config = serde_yaml::from_str(MINIMAL_YAML).unwrap();
+        let cfg: Config = serde_norway::from_str(MINIMAL_YAML).unwrap();
         assert_eq!(cfg.backend, Backend::Bws);
         cfg.validate()
             .expect("bws config needs no vaultwarden section");
@@ -399,11 +399,11 @@ mod tests {
         // The documented default, and the one `grace` mode caches approvals
         // for: a config that omits it must not silently get a different
         // window (0 would defeat the mode, a long one would widen exposure).
-        let implicit: Config = serde_yaml::from_str(MINIMAL_YAML).unwrap();
+        let implicit: Config = serde_norway::from_str(MINIMAL_YAML).unwrap();
         assert_eq!(implicit.authorization.grace_seconds, 60);
         assert_eq!(Authorization::default().grace_seconds, 60);
 
-        let explicit: Config = serde_yaml::from_str(&format!(
+        let explicit: Config = serde_norway::from_str(&format!(
             "{MINIMAL_YAML}authorization:\n  mode: grace\n  grace_seconds: 5\n"
         ))
         .unwrap();
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn vaultwarden_backend_requires_its_section() {
         let yaml = format!("{MINIMAL_YAML}backend: vaultwarden\n");
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let cfg: Config = serde_norway::from_str(&yaml).unwrap();
         let err = cfg
             .validate()
             .expect_err("must require the vaultwarden section");
@@ -428,7 +428,7 @@ mod tests {
         let yaml = format!(
             "{MINIMAL_YAML}backend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: tapwarden@example.com\n"
         );
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let cfg: Config = serde_norway::from_str(&yaml).unwrap();
         cfg.validate().unwrap();
         let vw = cfg.vaultwarden.unwrap();
         assert_eq!(vw.credentials, CredentialSource::Env, "must default to env");
@@ -442,7 +442,7 @@ mod tests {
         let yaml = format!(
             "{MINIMAL_YAML}backend: vaultwarden\nvaultwarden:\n  server_url: https://vault.example.com\n  email: tapwarden@example.com\n  credentials: keychain\n"
         );
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let cfg: Config = serde_norway::from_str(&yaml).unwrap();
         cfg.validate().unwrap();
         assert_eq!(
             cfg.vaultwarden.unwrap().credentials,
@@ -533,7 +533,7 @@ mod tests {
         let yaml = format!(
             "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: AA==\n"
         );
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let cfg: Config = serde_norway::from_str(&yaml).unwrap();
         let err = cfg
             .validate()
             .expect_err("assertions cannot be verified without the registered public key");
@@ -551,7 +551,7 @@ mod tests {
             let yaml = format!(
                 "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: AA==\n    public_key:\n      algorithm: {algorithm}\n      bytes: {key}\n"
             );
-            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            let cfg: Config = serde_norway::from_str(&yaml).unwrap();
             cfg.validate().unwrap();
         }
     }
@@ -566,7 +566,7 @@ mod tests {
             let yaml = format!(
                 "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: {credential_id}\n    public_key:\n      algorithm: es256\n      bytes: {key}\n"
             );
-            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            let cfg: Config = serde_norway::from_str(&yaml).unwrap();
             cfg.validate()
                 .expect_err("malformed verifier material must fail config validation");
         }
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn bws_remote_http_endpoint_fails_before_agent_installation() {
         let yaml = format!("{MINIMAL_YAML}server_endpoint: http://vault.example.com\n");
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let cfg: Config = serde_norway::from_str(&yaml).unwrap();
         let err = cfg
             .validate()
             .expect_err("remote BWS endpoints must never use cleartext HTTP");
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn empty_bws_endpoint_fails_before_agent_installation() {
         let yaml = format!("{MINIMAL_YAML}server_endpoint: ''\n");
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let cfg: Config = serde_norway::from_str(&yaml).unwrap();
         cfg.validate()
             .expect_err("empty BWS endpoint must fail config validation");
     }
@@ -641,7 +641,7 @@ mod tests {
     fn credential_accessors_read_the_configured_env_vars() {
         let name = "TAPWARDEN_TEST_VW_VALUE"; // set by .cargo/config.toml
         let cfg: Config =
-            serde_yaml::from_str(&format!("{MINIMAL_YAML}access_token_env: {name}\n")).unwrap();
+            serde_norway::from_str(&format!("{MINIMAL_YAML}access_token_env: {name}\n")).unwrap();
         assert_eq!(cfg.access_token().unwrap(), "stub-value");
 
         let vw = VaultwardenConfig {
@@ -668,7 +668,7 @@ mod tests {
             let yaml = format!(
                 "{MINIMAL_YAML}authorization:\n  factor: yubikey\n  yubikey:\n    credential_id: {credential_id}\n    public_key:\n      algorithm: {algorithm}\n      bytes: {key}\n"
             );
-            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            let cfg: Config = serde_norway::from_str(&yaml).unwrap();
             cfg.validate()
                 .expect_err("malformed verifier material must fail config validation");
         }

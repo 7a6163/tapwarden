@@ -756,7 +756,7 @@ mod tests {
             assert!(!yaml.to_lowercase().contains("password:"));
             assert!(!yaml.contains("client_secret:"));
 
-            let cfg: crate::config::Config = serde_yaml::from_str(&yaml).unwrap();
+            let cfg: crate::config::Config = serde_norway::from_str(&yaml).unwrap();
             assert_eq!(cfg.backend, crate::config::Backend::Vaultwarden);
             let vw = cfg.vaultwarden.expect("vaultwarden section");
             assert_eq!(vw.credentials, credentials);
