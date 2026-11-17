@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - rustls-webpki 0.103.16 (RUSTSEC-2026-0382), webpki-roots 1.0.11
   (RUSTSEC-2026-0381), ctutils 0.4.7 (RUSTSEC-2026-0385).
+- quinn-proto 0.11.19 (RUSTSEC-2026-0523, RUSTSEC-2026-0524), quinn-udp 0.5.16
+  (RUSTSEC-2026-0538), rustix 1.1.6 (RUSTSEC-2026-0486). Lockfile only: tapwarden
+  does not build the QUIC crates.
 - The agent now disables core dumps and denies debugger attach
   (`PT_DENY_ATTACH`) at startup, so decrypted private keys cannot be read out
   of its memory that way.
