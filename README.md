@@ -298,15 +298,26 @@ cargo test touch_id_prompt_manual -- --ignored --nocapture
 
 ## Security model
 
-- Every `sign` passes the `Authorizer` (Touch ID) — there is no silent signing
-  path, even for same-uid processes.
+- Every `sign` passes the `Authorizer` (Touch ID or a security-key touch) —
+  the agent has no silent signing path, even for same-uid processes that
+  reach its socket.
+- That guarantee covers requests made *to* the agent. It does not yet cover a
+  same-uid process that loads its own code *into* the agent or replaces the
+  binary: the release binary is unsigned and has no hardened runtime, so macOS
+  does not stop that. Developer ID signing is planned (see above).
+- The agent, `setup`, `store-token` and `doctor --check-backend` disable core
+  dumps and deny debugger attach, and keys, tokens and the master password are
+  wiped from memory when dropped. This is best effort: it narrows what a
+  memory dump can show, it does not defend against injected code.
 - The prompt names the requesting process and its parent (from the socket's
   peer credentials), and every verdict is logged with them. This is a hint
   for the human, not an access check: a same-uid process can name its binary
   anything, so approve only requests you just started.
 - With `credentials: keychain` (Vaultwarden), the backend credentials live in
-  the macOS Keychain and **every read is gated by a Touch ID prompt** — a
-  recent signature approval (`grace` mode) never unlocks them. An OS-level
+  the macOS Keychain and **every read tapwarden makes is gated by a Touch ID
+  prompt** — a recent signature approval (`grace` mode) never unlocks them.
+  Another program asking macOS for the items directly gets the system's own
+  keychain dialog instead, not tapwarden's presence check. An OS-level
   keychain ACL binding the entries to the tapwarden binary requires code signing
   and is future work.
 - Private keys, tokens, and the master password exist in memory only; error
