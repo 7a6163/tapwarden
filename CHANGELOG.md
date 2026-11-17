@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The decrypted OpenSSH private key text is wiped from memory once it has been
   parsed, instead of being left in freed memory.
 
+### Changed
+
+- The config file is now parsed with `serde_norway`, a maintained fork of the
+  deprecated `serde_yaml`, which drops the unmaintained `unsafe-libyaml`
+  (RUSTSEC-2024-0449). Config syntax is unchanged.
+
 ## [0.3.3] - 2026-10-20
 
 ### Fixed

@@ -449,7 +449,7 @@ mod tests {
     const KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
 
     fn parse(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).expect("test config parses")
+        serde_norway::from_str(yaml).expect("test config parses")
     }
 
     fn write_config(dir: &TmpDir, yaml: &str, mode: u32) -> std::path::PathBuf {

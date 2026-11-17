@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn yubikey_authorizer_rejects_malformed_public_key() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = serde_norway::from_str(
             r#"
 secret_ids: [00000000-0000-0000-0000-000000000000]
 authorization:
@@ -1030,7 +1030,7 @@ authorization:
     // ---- Wiring: config -> concrete fetcher / authorizer.
 
     fn parse_config(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).expect("test config parses")
+        serde_norway::from_str(yaml).expect("test config parses")
     }
 
     const KEY_ID: &str = "00000000-0000-0000-0000-000000000000";
