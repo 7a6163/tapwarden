@@ -6,4 +6,14 @@
 # Same path (ssh-key -> p256/p384/p521 -> elliptic-curve). Accepted risk:
 # tapwarden refuses non-Ed25519 keys, so no ECDSA secret ever reaches it;
 # revisit when ssh-key/ssh-agent-lib move to elliptic-curve 0.14.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
+# RUSTSEC-2026-0370/0371/0372: zvariant, zbus_names, zvariant_derive are
+# unmaintained. Pulled in via robius-authentication -> zbus (its Linux polkit
+# backend). Lockfile only: they are never compiled for macOS, the only target
+# tapwarden supports; revisit if tapwarden gains a Linux build.
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]
