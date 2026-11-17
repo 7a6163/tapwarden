@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The agent now disables core dumps and denies debugger attach
   (`PT_DENY_ATTACH`) at startup, so decrypted private keys cannot be read out
   of its memory that way.
+- `tapwarden setup` now refuses an API key from the server that is not a plain
+  alphanumeric token, so a malicious Vaultwarden server cannot smuggle shell
+  commands into the `export` line setup prints for env-credential mode.
 - The decrypted OpenSSH private key text is wiped from memory once it has been
   parsed, instead of being left in freed memory.
 
