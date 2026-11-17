@@ -363,9 +363,15 @@ async fn fetch_api_key(
     if !status.is_success() {
         bail!("api-key request failed: HTTP {status}");
     }
-    json_capped(response)
+    let key: ApiKeyResponse = json_capped(response)
         .await
-        .context("api-key request failed")
+        .context("api-key request failed")?;
+    // The server chooses this value and setup prints it inside a shell `export` line.
+    let safe = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    if key.api_key.is_empty() || key.api_key.len() > 128 || !key.api_key.chars().all(safe) {
+        bail!("api-key request failed: server returned a malformed API key");
+    }
+    Ok(key)
 }
 
 async fn fetch_profile(
@@ -931,6 +937,33 @@ mod tests {
         assert_eq!(
             ssh_key_items(sync.ciphers, &user).unwrap()[0].1,
             "deploy-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_api_key_that_could_break_out_of_the_export_line_is_refused() {
+        let http = http_client().unwrap();
+        for hostile in ["x'; echo INJECTED #", "abc\u{1b}[2K", "", &"a".repeat(129)] {
+            let server = stub(vec![(
+                "/api/accounts/api-key".to_string(),
+                200,
+                json!({ "apiKey": hostile }).to_string(),
+            )])
+            .await;
+            let err = err_of(fetch_api_key(&http, &server.base_url, "b", "h").await);
+            assert!(err.contains("malformed API key"), "{err}");
+            assert!(!err.contains("INJECTED"), "key echoed: {err}");
+        }
+        let server = stub(vec![(
+            "/api/accounts/api-key".to_string(),
+            200,
+            json!({ "apiKey": "a".repeat(128) }).to_string(),
+        )])
+        .await;
+        assert!(
+            fetch_api_key(&http, &server.base_url, "b", "h")
+                .await
+                .is_ok()
         );
     }
 
