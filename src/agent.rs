@@ -346,7 +346,8 @@ pub async fn run_foreground(config: Config, socket: Option<&str>) -> Result<()> 
 
 /// The agent holds decrypted private keys in memory. Keep them out of a core
 /// dump, and stop a debugger run as the same user from attaching to read them.
-fn harden_process() -> Result<()> {
+/// `main` also calls this for the one-shot commands that hold secrets.
+pub(crate) fn harden_process() -> Result<()> {
     disable_core_dumps()?;
     // SAFETY: PT_DENY_ATTACH takes no pointer arguments and only flags this process.
     if unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) } != 0 {

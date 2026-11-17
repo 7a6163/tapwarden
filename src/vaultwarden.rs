@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::authorizer::{AuthContext, Authorizer};
 use crate::keychain;
@@ -71,19 +72,25 @@ pub(crate) struct KdfParams {
 /// Master key derivation, mirroring the SDK's `KdfDerivedKeyMaterial::derive`:
 /// salt is the trimmed + lowercased email; PBKDF2-SHA256 uses it directly,
 /// Argon2id (v0x13) uses SHA-256(salt) and takes memory in MiB.
-pub(crate) fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) -> Result<[u8; 32]> {
+pub(crate) fn derive_master_key(
+    password: &str,
+    email: &str,
+    kdf: &KdfParams,
+) -> Result<Zeroizing<[u8; 32]>> {
     let salt = email.trim().to_lowercase();
     match kdf.kdf {
         KDF_PBKDF2 => {
             if !(PBKDF2_MIN_ITERATIONS..=PBKDF2_MAX_ITERATIONS).contains(&kdf.iterations) {
                 bail!("server reported PBKDF2 iterations outside the accepted range");
             }
-            Ok(pbkdf2::pbkdf2_array::<Hmac<Sha256>, 32>(
-                password.as_bytes(),
-                salt.as_bytes(),
-                kdf.iterations,
-            )
-            .expect("32 bytes is a valid PBKDF2 output length"))
+            Ok(Zeroizing::new(
+                pbkdf2::pbkdf2_array::<Hmac<Sha256>, 32>(
+                    password.as_bytes(),
+                    salt.as_bytes(),
+                    kdf.iterations,
+                )
+                .expect("32 bytes is a valid PBKDF2 output length"),
+            ))
         }
         KDF_ARGON2ID => {
             if !(ARGON2_MIN_ITERATIONS..=ARGON2_MAX_ITERATIONS).contains(&kdf.iterations) {
@@ -109,9 +116,9 @@ pub(crate) fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) ->
                 .map_err(|_| anyhow!("invalid Argon2 parameters"))?;
             let argon =
                 argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-            let mut key = [0u8; 32];
+            let mut key = Zeroizing::new([0u8; 32]);
             argon
-                .hash_password_into(password.as_bytes(), &salt_sha, &mut key)
+                .hash_password_into(password.as_bytes(), &salt_sha, key.as_mut_slice())
                 .map_err(|_| anyhow!("Argon2 derivation failed"))?;
             Ok(key)
         }
@@ -124,13 +131,16 @@ pub(crate) fn derive_master_key(password: &str, email: &str, kdf: &KdfParams) ->
 /// `"enc"` and `"mac"` into the two 32-byte halves.
 pub(crate) fn stretch_master_key(master_key: &[u8; 32]) -> SymKey {
     let hkdf = Hkdf::<Sha256>::from_prk(master_key).expect("PRK is exactly 32 bytes");
-    let mut enc = [0u8; 32];
-    let mut mac = [0u8; 32];
-    hkdf.expand(b"enc", &mut enc)
+    // Expanded in place so no copy of either half is left outside the key.
+    let mut key = SymKey {
+        enc: [0u8; 32],
+        mac: [0u8; 32],
+    };
+    hkdf.expand(b"enc", &mut key.enc)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
-    hkdf.expand(b"mac", &mut mac)
+    hkdf.expand(b"mac", &mut key.mac)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
-    SymKey { enc, mac }
+    key
 }
 
 /// The server authorization hash sent as `password` / `masterPasswordHash`:
@@ -212,7 +222,7 @@ fn extract_secret(cipher: CipherResponse, user_key: &SymKey) -> Result<SecretDat
 
 /// An authenticated Vaultwarden session: bearer + decrypted 64-byte user key.
 struct Session {
-    bearer: String,
+    bearer: Zeroizing<String>,
     user_key: SymKey,
 }
 
@@ -307,7 +317,7 @@ impl VaultwardenFetcher {
     async fn acquire_credentials(
         &self,
         pending: &VwCredentials,
-    ) -> Result<(String, String, String)> {
+    ) -> Result<(String, Zeroizing<String>, Zeroizing<String>)> {
         match pending {
             VwCredentials::Env {
                 client_id,
@@ -315,8 +325,8 @@ impl VaultwardenFetcher {
                 master_password,
             } => Ok((
                 client_id.clone(),
-                client_secret.clone(),
-                master_password.clone(),
+                Zeroizing::new(client_secret.clone()),
+                Zeroizing::new(master_password.clone()),
             )),
             VwCredentials::Keychain => {
                 let ctx = AuthContext::UnlockCredentials {
@@ -336,8 +346,8 @@ impl VaultwardenFetcher {
                 validate_client_id(&client_id)?;
                 Ok((
                     client_id,
-                    keychain::read(keychain::VW_CLIENT_SECRET)?,
-                    keychain::read(keychain::VW_MASTER_PASSWORD)?,
+                    Zeroizing::new(keychain::read(keychain::VW_CLIENT_SECRET)?),
+                    Zeroizing::new(keychain::read(keychain::VW_MASTER_PASSWORD)?),
                 ))
             }
         }
@@ -413,7 +423,7 @@ impl VaultwardenFetcher {
             .context("login failed: bad user key")?;
 
         Ok(Session {
-            bearer: token_response.access_token,
+            bearer: Zeroizing::new(token_response.access_token),
             user_key,
         })
     }
@@ -455,7 +465,7 @@ impl SecretFetcher for VaultwardenFetcher {
             let fetched = self
                 .http
                 .get(format!("{}/api/ciphers/{}", self.server_url, id))
-                .bearer_auth(&session.bearer)
+                .bearer_auth(session.bearer.as_str())
                 .header(reqwest::header::ACCEPT, "application/json")
                 .header(CLIENT_VERSION_HEADER, CLIENT_VERSION)
                 .send()

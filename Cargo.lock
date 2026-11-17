@@ -716,6 +716,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -853,6 +854,7 @@ dependencies = [
  "ed25519",
  "sha2",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2821,6 +2823,7 @@ dependencies = [
  "clap",
  "ctap-hid-fido2",
  "dirs",
+ "ed25519-dalek",
  "hkdf",
  "hmac",
  "keyring",
