@@ -76,7 +76,27 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    run(Cli::parse().command).await
+    let command = Cli::parse().command;
+    // Here, not in `run`: tests drive `run`, and denying debugger attach
+    // would kill a test process that is being debugged.
+    if holds_secrets(&command) {
+        agent::harden_process()?;
+    }
+    run(command).await
+}
+
+/// One-shot commands that hold backend credentials or decrypted keys in
+/// memory. `start --fg` hardens itself in `agent::run_foreground`.
+fn holds_secrets(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Setup
+            | Commands::StoreToken
+            | Commands::Doctor {
+                check_backend: true,
+                ..
+            }
+    )
 }
 
 /// Dispatch one parsed subcommand. Split out of `main` so the arms that only
@@ -200,6 +220,19 @@ mod tests {
             .expect_err("a missing config must stop start in its tracks");
             assert!(err.to_string().contains("configuration"), "{err:#}");
         }
+    }
+
+    #[test]
+    fn only_the_commands_that_hold_secrets_are_hardened() {
+        let doctor = |check_backend| Commands::Doctor {
+            config: None,
+            check_backend,
+        };
+        assert!(holds_secrets(&Commands::Setup));
+        assert!(holds_secrets(&Commands::StoreToken));
+        assert!(holds_secrets(&doctor(true)));
+        assert!(!holds_secrets(&doctor(false)));
+        assert!(!holds_secrets(&Commands::Logs));
     }
 
     #[tokio::test]

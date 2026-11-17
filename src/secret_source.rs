@@ -90,6 +90,13 @@ pub(crate) struct SymKey {
     pub(crate) mac: [u8; 32],
 }
 
+impl Drop for SymKey {
+    fn drop(&mut self) {
+        self.enc.zeroize();
+        self.mac.zeroize();
+    }
+}
+
 impl SymKey {
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 64 {
@@ -111,10 +118,10 @@ impl SymKey {
             .finalize()
             .into_bytes();
         let hkdf = Hkdf::<Sha256>::from_prk(&prk).expect("PRK is exactly 32 bytes");
-        let mut okm = [0u8; 64];
-        hkdf.expand(b"sm-access-token", &mut okm)
+        let mut okm = Zeroizing::new([0u8; 64]);
+        hkdf.expand(b"sm-access-token", okm.as_mut_slice())
             .expect("64 bytes is a valid HKDF-SHA256 output length");
-        Self::from_bytes(&okm).expect("okm is 64 bytes")
+        Self::from_bytes(okm.as_slice()).expect("okm is 64 bytes")
     }
 }
 
@@ -154,7 +161,8 @@ impl EncString {
     }
 
     /// MAC-verify (constant-time, over iv || ciphertext) *before* decrypting.
-    pub(crate) fn decrypt(&self, key: &SymKey) -> Result<Vec<u8>> {
+    /// The plaintext is often key material, so it is wiped when dropped.
+    pub(crate) fn decrypt(&self, key: &SymKey) -> Result<Zeroizing<Vec<u8>>> {
         let mut hmac = HmacSha256::new_from_slice(&key.mac).expect("HMAC accepts any key length");
         hmac.update(&self.iv);
         hmac.update(&self.data);
@@ -164,17 +172,19 @@ impl EncString {
 
         Aes256CbcDec::new(&key.enc.into(), &self.iv.into())
             .decrypt_padded_vec_mut::<Pkcs7>(&self.data)
+            .map(Zeroizing::new)
             .map_err(|_| anyhow!("EncString decryption failed (bad padding)"))
     }
 
     pub(crate) fn decrypt_to_string(&self, key: &SymKey) -> Result<String> {
-        String::from_utf8(self.decrypt(key)?).context("decrypted value is not valid UTF-8")
+        String::from_utf8(std::mem::take(&mut *self.decrypt(key)?))
+            .context("decrypted value is not valid UTF-8")
     }
 
     /// `decrypt_to_string` for private key material: every buffer holding the
     /// plaintext, including one rejected as non-UTF-8, is wiped when dropped.
     pub(crate) fn decrypt_secret(&self, key: &SymKey) -> Result<Zeroizing<String>> {
-        match String::from_utf8(self.decrypt(key)?) {
+        match String::from_utf8(std::mem::take(&mut *self.decrypt(key)?)) {
             Ok(text) => Ok(Zeroizing::new(text)),
             Err(e) => {
                 e.into_bytes().zeroize();
@@ -242,7 +252,7 @@ pub(crate) async fn json_capped_limit<T: serde::de::DeserializeOwned>(
 /// (`0.<client_id>.<client_secret>:<base64 16-byte key seed>`).
 struct AccessToken {
     client_id: Uuid,
-    client_secret: String,
+    client_secret: Zeroizing<String>,
     /// Key derived from the seed; decrypts the identity `encrypted_payload`.
     encryption_key: SymKey,
 }
@@ -269,7 +279,7 @@ impl AccessToken {
             .map_err(|_| anyhow!("malformed access token: encryption key is not 16 bytes"))?;
         Ok(Self {
             client_id,
-            client_secret: client_secret.to_string(),
+            client_secret: Zeroizing::new(client_secret.to_string()),
             encryption_key: SymKey::derive_access_token_key(&seed),
         })
     }
@@ -277,7 +287,7 @@ impl AccessToken {
 
 /// An authenticated BWS session: bearer token + decrypted org symmetric key.
 struct Session {
-    bearer: String,
+    bearer: Zeroizing<String>,
     org_key: SymKey,
 }
 
@@ -436,7 +446,7 @@ impl BwsRest {
         if !approved {
             bail!("credential unlock denied — the keychain was not read");
         }
-        let token = keychain::read(keychain::BWS_ACCESS_TOKEN)?;
+        let token = Zeroizing::new(keychain::read(keychain::BWS_ACCESS_TOKEN)?);
         AccessToken::parse(&token)
     }
 
@@ -485,12 +495,13 @@ impl BwsRest {
             .context("token exchange failed: payload is not the expected JSON")?;
         let org_key = B64
             .decode(&payload.encryption_key)
+            .map(Zeroizing::new)
             .context("token exchange failed: organization key is not base64")
             .and_then(|k| SymKey::from_bytes(&k))
             .context("token exchange failed: bad organization key")?;
 
         Ok(Session {
-            bearer: token_response.access_token,
+            bearer: Zeroizing::new(token_response.access_token),
             org_key,
         })
     }
@@ -531,7 +542,7 @@ impl SecretFetcher for BwsRest {
             let fetched = self
                 .http
                 .get(format!("{}/secrets/{}", self.api_url, id))
-                .bearer_auth(&session.bearer)
+                .bearer_auth(session.bearer.as_str())
                 .header(reqwest::header::ACCEPT, "application/json")
                 .send()
                 .await
@@ -626,13 +637,27 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as B64_PAD;
 
     #[test]
+    fn a_dropped_symkey_is_wiped() {
+        let mut key = std::mem::ManuallyDrop::new(SymKey {
+            enc: [7; 32],
+            mac: [9; 32],
+        });
+        // SAFETY: dropped exactly once; the storage outlives the drop and holds plain bytes.
+        unsafe { std::mem::ManuallyDrop::drop(&mut key) };
+        assert_eq!((key.enc, key.mac), ([0; 32], [0; 32]));
+    }
+
+    #[test]
     fn parses_access_token_and_derives_sdk_known_key() {
         let token = AccessToken::parse(SDK_TEST_TOKEN).unwrap();
         assert_eq!(
             token.client_id.to_string(),
             "ec2c1d46-6a4b-4751-a310-af9601317f2d"
         );
-        assert_eq!(token.client_secret, "C2IgxjjLF7qSshsbwe8JGcbM075YXw");
+        assert_eq!(
+            token.client_secret.as_str(),
+            "C2IgxjjLF7qSshsbwe8JGcbM075YXw"
+        );
         // Expected enc||mac key from the SDK's own test vector.
         let mut key = token.encryption_key.enc.to_vec();
         key.extend_from_slice(&token.encryption_key.mac);
@@ -702,7 +727,7 @@ mod tests {
         let key = test_key();
         let s = make_enc_string(b"-----BEGIN OPENSSH PRIVATE KEY-----", &key, [0x33; 16]);
         let out = EncString::parse(&s).unwrap().decrypt(&key).unwrap();
-        assert_eq!(out, b"-----BEGIN OPENSSH PRIVATE KEY-----");
+        assert_eq!(out.as_slice(), b"-----BEGIN OPENSSH PRIVATE KEY-----");
     }
 
     #[test]

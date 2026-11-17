@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commands into the `export` line setup prints for env-credential mode.
 - The decrypted OpenSSH private key text is wiped from memory once it has been
   parsed, instead of being left in freed memory.
+- Backend secrets are now wiped from memory when dropped as well: the BWS
+  organization key and client secret, the Vaultwarden user and item keys,
+  master password and derived master key, session bearer tokens, and the
+  signing key built for each signature.
+- `tapwarden setup`, `store-token` and `doctor --check-backend` now disable
+  core dumps and deny debugger attach like the agent does, since they hold
+  credentials or decrypted keys while they run.
 
 ### Changed
 

@@ -14,6 +14,7 @@ use serde::Deserialize;
 use std::io::Write;
 use std::path::PathBuf;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::config::{CONFIG_REL, CredentialSource};
 use crate::keychain;
@@ -140,15 +141,17 @@ pub async fn run() -> Result<()> {
     };
     let email = prompt("Account email: ")?;
     validate_email(&email)?;
-    let master_password = rpassword::prompt_password("Master password (hidden): ")
-        .context("failed to read the master password")?;
+    let master_password = Zeroizing::new(
+        rpassword::prompt_password("Master password (hidden): ")
+            .context("failed to read the master password")?,
+    );
 
     let http = http_client()?;
 
     let kdf: KdfParams = prelogin(&http, &server_url, &email).await?.into();
     let master_key = derive_master_key(&master_password, &email, &kdf)
         .context("setup failed: master key derivation")?;
-    let password_hash = server_auth_hash(&master_key, &master_password);
+    let password_hash = Zeroizing::new(server_auth_hash(&master_key, &master_password));
     // master_password is kept (memory only) until the storage decision below:
     // the keychain path stores it so the agent can run without env vars.
 
@@ -162,9 +165,11 @@ pub async fn run() -> Result<()> {
         .and_then(|bytes| SymKey::from_bytes(&bytes))
         .context("login failed: bad user key")?;
 
-    let client_secret = fetch_api_key(&http, &server_url, &token.access_token, &password_hash)
-        .await?
-        .api_key;
+    let client_secret = Zeroizing::new(
+        fetch_api_key(&http, &server_url, &token.access_token, &password_hash)
+            .await?
+            .api_key,
+    );
     let client_id = format!(
         "user.{}",
         fetch_profile(&http, &server_url, &token.access_token)
@@ -234,7 +239,10 @@ pub async fn run() -> Result<()> {
                 "\nAdd these to your environment (e.g. ~/.zshenv — keep them out of anything world-readable):\n"
             );
             println!("  export TAPWARDEN_VW_CLIENT_ID='{client_id}'");
-            println!("  export TAPWARDEN_VW_CLIENT_SECRET='{client_secret}'");
+            println!(
+                "  export TAPWARDEN_VW_CLIENT_SECRET='{}'",
+                client_secret.as_str()
+            );
             println!("  export TAPWARDEN_VW_MASTER_PASSWORD='<type your master password here>'");
             println!(
                 "\ntapwarden never stores or prints the master password; fill it in yourself."
